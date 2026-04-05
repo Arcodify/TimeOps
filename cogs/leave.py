@@ -138,6 +138,24 @@ class LeaveRequestModal(discord.ui.Modal, title="Leave Request"):
         self.db = db
         self.leave_channel_id = leave_channel_id
 
+    async def _resolve_leave_channel(self, guild: discord.Guild):
+        if not self.leave_channel_id:
+            return None
+
+        channel = None
+        if hasattr(guild, "get_channel_or_thread"):
+            channel = guild.get_channel_or_thread(int(self.leave_channel_id))
+        else:
+            channel = guild.get_channel(int(self.leave_channel_id))
+
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(self.leave_channel_id))
+            except Exception:
+                channel = None
+
+        return channel
+
     async def on_submit(self, interaction: discord.Interaction):
         # Validate dates
         try:
@@ -187,7 +205,7 @@ class LeaveRequestModal(discord.ui.Modal, title="Leave Request"):
         msg = None
         if self.leave_channel_id:
             try:
-                channel = interaction.guild.get_channel(int(self.leave_channel_id))
+                channel = await self._resolve_leave_channel(interaction.guild)
                 if channel:
                     msg = await channel.send(embed=embed, view=view)
                     await self.db.set_leave_message_id(request_id, str(msg.id))

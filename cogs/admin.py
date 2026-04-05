@@ -20,9 +20,41 @@ class Admin(commands.Cog):
         self.bot = bot
         self.db = bot.db
 
+    async def _resolve_leave_channel(self, interaction: discord.Interaction, leave_channel):
+        if leave_channel is None:
+            return None
+
+        if isinstance(leave_channel, (discord.TextChannel, discord.Thread)):
+            return leave_channel
+
+        channel = None
+        if hasattr(leave_channel, "resolve"):
+            channel = leave_channel.resolve()
+        if channel is None and hasattr(leave_channel, "fetch"):
+            try:
+                channel = await leave_channel.fetch()
+            except Exception:
+                channel = None
+
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ I could not resolve that channel. Please pick a channel the bot can access.",
+                ephemeral=True,
+            )
+            return None
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.response.send_message(
+                "❌ Leave notifications need a text channel or thread. Forum, voice, stage, and category channels are not supported.",
+                ephemeral=True,
+            )
+            return None
+
+        return channel
+
     @admin_group.command(name="setup", description="Configure HR bot for this server")
     @app_commands.describe(
-        leave_channel="Channel for leave request notifications",
+        leave_channel="Text channel or thread for leave request notifications",
         admin_role="Role that can approve leave and view admin reports",
         timezone="Server timezone for display (e.g. UTC, US/Eastern, Asia/Kathmandu)"
     )
@@ -30,10 +62,14 @@ class Admin(commands.Cog):
     async def hrsetup(
         self,
         interaction: discord.Interaction,
-        leave_channel: discord.TextChannel = None,
+        leave_channel: discord.app_commands.AppCommandChannel = None,
         admin_role: discord.Role = None,
         timezone: str = "UTC"
     ):
+        leave_channel = await self._resolve_leave_channel(interaction, leave_channel)
+        if leave_channel is None and interaction.response.is_done():
+            return
+
         await self.db.set_guild_config(
             str(interaction.guild_id),
             leave_channel_id=str(leave_channel.id) if leave_channel else None,
