@@ -37,27 +37,15 @@ standup_scheduler = StandupScheduler(db)
 async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     standup_scheduler.set_bot(bot)
+    log.info("Bot ready")
 
-    try:
-        if SYNC_GUILD_ID:
-            guild = discord.Object(id=int(SYNC_GUILD_ID))
-
-            # Phase 1: push EMPTY command list to Discord to nuke stale commands
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-            log.info("Cleared all guild commands from Discord")
-
-            # Phase 2: reload all cog commands into tree, then push
-            bot.tree.clear_commands(guild=None)
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            log.info(f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}")
-        else:
-            bot.tree.clear_commands(guild=None)
-            synced = await bot.tree.sync()
-            log.info(f"Synced {len(synced)} slash commands globally")
-    except Exception as e:
-        log.error(f"Failed to sync commands: {e}")
+    if not auto_checkout_loop.is_running():
+        auto_checkout_loop.start()
+    if not standup_check_loop.is_running():
+        standup_check_loop.start()
+    if not daily_export_loop.is_running():
+        daily_export_loop.start()
+    log.info("Background tasks started")
 
 
 # ─── BACKGROUND TASKS ────────────────────────────────────────────────────────
@@ -94,7 +82,6 @@ async def daily_export_loop():
 
 async def main():
     async with bot:
-        # Init DB first so bot.db is ready for all cogs
         await db.init()
         for ext in [
             "cogs.timeclock",
@@ -108,6 +95,24 @@ async def main():
             "cogs.help",
         ]:
             await bot.load_extension(ext)
+
+        # Sync AFTER cogs are loaded so all commands are registered
+        async with bot:
+            await bot.login(os.getenv("DISCORD_TOKEN"))
+
+            if SYNC_GUILD_ID:
+                guild = discord.Object(id=int(SYNC_GUILD_ID))
+                # Phase 1: clear
+                bot.tree.clear_commands(guild=guild)
+                await bot.http.bulk_upsert_guild_commands(
+                    bot.application_id, int(SYNC_GUILD_ID), []
+                )
+                log.info("Cleared all guild commands")
+                # Phase 2: sync fresh
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                log.info(f"Synced {len(synced)} commands")
+
         await bot.start(os.getenv("DISCORD_TOKEN"))
 
 
