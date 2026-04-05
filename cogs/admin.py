@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+import re
 
 log = logging.getLogger("Admin")
 
@@ -19,6 +20,46 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db = bot.db
+
+    def _parse_snowflake(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, int):
+            return value
+
+        text = str(value).strip()
+        match = (
+            re.fullmatch(r"<#(\d+)>", text)
+            or re.fullmatch(r"<@&(\d+)>", text)
+            or re.fullmatch(r"(\d+)", text)
+        )
+        return int(match.group(1)) if match else None
+
+    async def _resolve_channel_input(self, guild: discord.Guild, value):
+        channel_id = self._parse_snowflake(value)
+        if channel_id is None:
+            return None
+
+        if hasattr(guild, "get_channel_or_thread"):
+            channel = guild.get_channel_or_thread(channel_id)
+            if channel:
+                return channel
+
+        channel = guild.get_channel(channel_id)
+        if channel:
+            return channel
+
+        try:
+            return await guild.fetch_channel(channel_id)
+        except Exception:
+            return None
+
+    def _resolve_role_input(self, guild: discord.Guild, value):
+        role_id = self._parse_snowflake(value)
+        if role_id is None:
+            return None
+        return guild.get_role(role_id)
 
     async def _resolve_leave_channel(self, interaction: discord.Interaction, leave_channel):
         if leave_channel is None:
@@ -83,6 +124,39 @@ class Admin(commands.Cog):
         embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
         embed.set_footer(text="Use /hrconfig overtime to set work hour policies")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @commands.command(name="hrsetup")
+    @commands.has_permissions(administrator=True)
+    async def hrsetup_prefix(
+        self,
+        ctx: commands.Context,
+        leave_channel: str = None,
+        admin_role: str = None,
+        timezone: str = "UTC"
+    ):
+        leave_obj = await self._resolve_channel_input(ctx.guild, leave_channel) if leave_channel else None
+        role_obj = self._resolve_role_input(ctx.guild, admin_role) if admin_role else None
+
+        if leave_channel and leave_obj is None:
+            await ctx.send("❌ I could not resolve that leave channel. Use a channel mention like `#leave-requests` or a channel ID.")
+            return
+
+        if admin_role and role_obj is None:
+            await ctx.send("❌ I could not resolve that admin role. Use a role mention like `@Managers` or a role ID.")
+            return
+
+        await self.db.set_guild_config(
+            str(ctx.guild.id),
+            leave_channel_id=str(leave_obj.id) if leave_obj else None,
+            admin_role_id=str(role_obj.id) if role_obj else None,
+            timezone=timezone
+        )
+
+        embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
+        embed.add_field(name="Leave Channel", value=leave_obj.mention if leave_obj else "Not set", inline=True)
+        embed.add_field(name="Admin Role", value=role_obj.mention if role_obj else "Not set", inline=True)
+        embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
+        await ctx.send(embed=embed)
 
     @admin_group.command(name="view", description="View current HR bot configuration")
     @app_commands.checks.has_permissions(manage_guild=True)
