@@ -24,6 +24,7 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("HRBot")
+SYNC_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,8 +43,14 @@ async def on_ready():
     
     # Sync slash commands
     try:
-        synced = await bot.tree.sync()
-        log.info(f"Synced {len(synced)} slash commands")
+        if SYNC_GUILD_ID:
+            guild = discord.Object(id=int(SYNC_GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            log.info(f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            log.info(f"Synced {len(synced)} slash commands")
     except Exception as e:
         log.error(f"Failed to sync commands: {e}")
 
