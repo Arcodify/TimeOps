@@ -86,7 +86,7 @@ PAGES = [
         "fields": [
             ("/hrconfig setup", "Set leave channel, admin role, timezone"),
             ("/hrconfig view", "View current bot configuration"),
-            ("/overtime config", "Set daily/weekly hours + auto clock-out limit"),
+            ("/overtime config", "Set daily/weekly hours, break allowance, and blocked clock-in days"),
         ]
     },
 ]

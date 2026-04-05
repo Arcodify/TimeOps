@@ -203,12 +203,15 @@ class LeaveRequestModal(discord.ui.Modal, title="Leave Request"):
         
         # Send to leave channel
         msg = None
+        channel_warning = ""
         if self.leave_channel_id:
             try:
                 channel = await self._resolve_leave_channel(interaction.guild)
                 if channel:
                     msg = await channel.send(embed=embed, view=view)
                     await self.db.set_leave_message_id(request_id, str(msg.id))
+            except discord.Forbidden:
+                channel_warning = "\n\n⚠️ I could not post this request to the leave channel because the bot lacks access."
             except Exception as e:
                 log.error(f"Failed to post to leave channel: {e}")
         
@@ -231,7 +234,7 @@ class LeaveRequestModal(discord.ui.Modal, title="Leave Request"):
 
         await interaction.response.send_message(
             f"✅ Your leave request (#{request_id}) has been submitted successfully!\n"
-            f"You'll be notified when it's reviewed.{holiday_warning}",
+            f"You'll be notified when it's reviewed.{holiday_warning}{channel_warning}",
             ephemeral=True
         )
 

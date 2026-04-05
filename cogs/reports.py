@@ -88,7 +88,9 @@ class Reports(commands.Cog):
         # Quick stats for embed
         entries = await self.db.get_all_entries_range(guild_id, start, end)
         user_count = len(set(e["user_id"] for e in entries))
-        total_mins = sum(e["duration_minutes"] or 0 for e in entries if e["clock_out"])
+        total_mins = 0
+        for uid in set(e["user_id"] for e in entries):
+            total_mins += (await self.db.get_user_summary(guild_id, uid, start, end))["total_minutes"]
         
         embed = discord.Embed(
             title="📈 Summary Report",
@@ -115,15 +117,12 @@ class Reports(commands.Cog):
         entries = await self.db.get_all_entries_range(guild_id, start, end)
         config = await self.db.get_overtime_config(guild_id)
         
-        # Group by user
         from collections import defaultdict
-        user_data = defaultdict(lambda: {"username": "", "total_mins": 0, "days": set()})
+        user_data = defaultdict(lambda: {"username": "", "entry_count": 0})
         for e in entries:
-            if e["clock_out"]:
-                uid = e["user_id"]
-                user_data[uid]["username"] = e["username"]
-                user_data[uid]["total_mins"] += e["duration_minutes"] or 0
-                user_data[uid]["days"].add(e["clock_in"][:10])
+            uid = e["user_id"]
+            user_data[uid]["username"] = e["username"]
+            user_data[uid]["entry_count"] += 1
         
         if not user_data:
             await interaction.followup.send("📭 No data for that period.", ephemeral=True)
@@ -138,10 +137,12 @@ class Reports(commands.Cog):
         
         overtime_users = []
         for uid, u in user_data.items():
-            days = len(u["days"])
+            summary = await self.db.get_user_summary(guild_id, uid, start, end)
+            days = summary["days_worked"]
+            total = summary["total_minutes"]
             expected = config["daily_hours"] * 60 * days
-            ot = u["total_mins"] - expected
-            overtime_users.append((u["username"], u["total_mins"], int(ot), days))
+            ot = total - expected
+            overtime_users.append((u["username"], total, int(ot), days))
         
         overtime_users.sort(key=lambda x: x[2], reverse=True)
         
@@ -203,6 +204,7 @@ class Reports(commands.Cog):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="Period", value=f"{start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}", inline=False)
         embed.add_field(name="Total Hours", value=f"**{fmt_duration(summary['total_minutes'])}**", inline=True)
+        embed.add_field(name="Break Time", value=fmt_duration(summary["break_minutes"]), inline=True)
         embed.add_field(name="Days Worked", value=str(summary["days_worked"]), inline=True)
         embed.add_field(name="Sessions", value=str(summary["entry_count"]), inline=True)
         

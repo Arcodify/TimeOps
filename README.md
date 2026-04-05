@@ -67,7 +67,7 @@ Run these in Discord once the bot is online:
 
 ```
 /hrconfig setup leave_channel:#leave-requests admin_role:@Managers timezone:Asia/Kathmandu
-/overtime config daily_hours:8 weekly_hours:40 auto_out_hours:12
+/overtime config daily_hours:8 weekly_hours:40 auto_out_hours:12 default_break_minutes:60 blocked_weekdays:sat
 ```
 
 Post a clock-in panel in your work channel:

@@ -9,9 +9,11 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 from datetime import datetime
-from database import Database
+from zoneinfo import ZoneInfo
+from database import Database, parse_blocked_weekdays
 
 log = logging.getLogger("TimeClock")
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
 def fmt_duration(minutes: int) -> str:
@@ -22,6 +24,33 @@ def fmt_duration(minutes: int) -> str:
     return f"{h}h {m:02d}m"
 
 
+def _format_weekdays(days: list[int]) -> str:
+    labels = [WEEKDAY_NAMES[day] for day in days if 0 <= day <= 6]
+    return ", ".join(labels) if labels else "No blocked days"
+
+
+async def _can_clock_in(db: Database, guild_id: str) -> tuple[bool, str | None]:
+    guild_config = await db.get_guild_config(guild_id)
+    work_rules = await db.get_work_rules(guild_id)
+
+    timezone_name = guild_config.get("timezone") or "UTC"
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+        timezone_name = "UTC"
+
+    local_now = datetime.now(tz)
+    blocked_days = parse_blocked_weekdays(work_rules.get("blocked_weekdays"))
+    if local_now.weekday() in blocked_days:
+        return False, (
+            f"⚠️ Clock in is disabled on **{local_now.strftime('%A')}** in `{timezone_name}`. "
+            f"Blocked days: **{_format_weekdays(blocked_days)}**."
+        )
+
+    return True, None
+
+
 class ClockPanel(discord.ui.View):
     """Persistent clock in/out panel with buttons."""
     def __init__(self, db: Database):
@@ -30,6 +59,11 @@ class ClockPanel(discord.ui.View):
 
     @discord.ui.button(label="🟢 Clock In", style=discord.ButtonStyle.success, custom_id="hr:clockin")
     async def clock_in_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        allowed, message = await _can_clock_in(self.db, str(interaction.guild_id))
+        if not allowed:
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+
         result = await self.db.clock_in(
             str(interaction.guild_id),
             str(interaction.user.id),
@@ -113,6 +147,7 @@ async def _send_status(interaction: discord.Interaction, db: Database, user: dis
         embed.add_field(name="Status", value="🔴 **Clocked Out**", inline=False)
     
     embed.add_field(name="Today Total", value=fmt_duration(summary["total_minutes"]), inline=True)
+    embed.add_field(name="Break Time", value=fmt_duration(summary["break_minutes"]), inline=True)
     embed.add_field(name="Today Sessions", value=str(summary["entry_count"]), inline=True)
     if summary["overtime_minutes"] > 0:
         embed.add_field(name="⚡ Overtime Today", value=fmt_duration(summary["overtime_minutes"]), inline=True)
@@ -129,6 +164,11 @@ class TimeClock(commands.Cog):
     @app_commands.command(name="clockin", description="Clock in to start your work session")
     @app_commands.describe(note="Optional note for this session")
     async def clockin(self, interaction: discord.Interaction, note: str = None):
+        allowed, message = await _can_clock_in(self.db, str(interaction.guild_id))
+        if not allowed:
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+
         result = await self.db.clock_in(
             str(interaction.guild_id),
             str(interaction.user.id),
@@ -166,12 +206,16 @@ class TimeClock(commands.Cog):
             await interaction.response.send_message("⚠️ You're not currently clocked in.", ephemeral=True)
             return
         
+        break_minutes = await self.db.get_break_minutes_for_entry(result["entry_id"])
         config = await self.db.get_overtime_config(str(interaction.guild_id))
         daily_mins = config["daily_hours"] * 60
-        overtime = max(0, result["duration_minutes"] - daily_mins)
+        net_minutes = max(0, result["duration_minutes"] - break_minutes)
+        overtime = max(0, net_minutes - daily_mins)
         
         embed = discord.Embed(title="🔴 Clocked Out", color=0xED4245, timestamp=datetime.utcnow())
-        embed.add_field(name="Duration", value=f"**{fmt_duration(result['duration_minutes'])}**", inline=True)
+        embed.add_field(name="Gross Duration", value=f"`{fmt_duration(result['duration_minutes'])}`", inline=True)
+        embed.add_field(name="Break Time", value=f"`{fmt_duration(break_minutes)}`", inline=True)
+        embed.add_field(name="Net Duration", value=f"**{fmt_duration(net_minutes)}**", inline=True)
         embed.add_field(name="Clock In", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`", inline=True)
         embed.add_field(name="Clock Out", value=f"`{result['clock_out'].replace('T',' ')[:16]} UTC`", inline=True)
         if overtime > 0:
@@ -198,7 +242,29 @@ class TimeClock(commands.Cog):
         )
         embed.set_footer(text="HR Bot • Time Tracker")
         view = ClockPanel(self.db)
-        await interaction.channel.send(embed=embed, view=view)
+        try:
+            if interaction.channel is None:
+                raise RuntimeError("Missing channel")
+            await interaction.channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I don't have access to post in this channel. Move this command to a channel the bot can see and send messages in.",
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Failed to post the panel: {e}",
+                ephemeral=True
+            )
+            return
+        except RuntimeError:
+            await interaction.response.send_message(
+                "❌ I couldn't find a text channel to post the panel into.",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_message("✅ Clock panel posted!", ephemeral=True)
 
 

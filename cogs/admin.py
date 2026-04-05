@@ -9,11 +9,24 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 import re
+from database import normalize_blocked_weekdays
 
 log = logging.getLogger("Admin")
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 admin_group = app_commands.Group(name="hrconfig", description="HR Bot server configuration")
 overtime_group = app_commands.Group(name="overtime", description="Overtime configuration")
+
+
+def _weekday_labels(blocked_weekdays: str) -> str:
+    labels = []
+    for item in normalize_blocked_weekdays(blocked_weekdays).split(","):
+        if not item:
+            continue
+        idx = int(item)
+        if 0 <= idx <= 6:
+            labels.append(WEEKDAY_NAMES[idx])
+    return ", ".join(labels) if labels else "Saturday"
 
 
 class Admin(commands.Cog):
@@ -163,6 +176,7 @@ class Admin(commands.Cog):
     async def hrview(self, interaction: discord.Interaction):
         config = await self.db.get_guild_config(str(interaction.guild_id))
         ot_config = await self.db.get_overtime_config(str(interaction.guild_id))
+        work_rules = await self.db.get_work_rules(str(interaction.guild_id))
         
         embed = discord.Embed(title="⚙️ HR Bot Configuration", color=0x5865F2)
         
@@ -184,6 +198,8 @@ class Admin(commands.Cog):
         embed.add_field(name="Daily Work Hours", value=f"`{ot_config['daily_hours']}h`", inline=True)
         embed.add_field(name="Weekly Work Hours", value=f"`{ot_config['weekly_hours']}h`", inline=True)
         embed.add_field(name="Auto Clock-Out After", value=f"`{ot_config['auto_out_hours']}h`", inline=True)
+        embed.add_field(name="Default Break", value=f"`{work_rules['default_break_minutes']} min`", inline=True)
+        embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(work_rules.get("blocked_weekdays")), inline=True)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -191,7 +207,9 @@ class Admin(commands.Cog):
     @app_commands.describe(
         daily_hours="Standard work hours per day (default 8)",
         weekly_hours="Standard work hours per week (default 40)",
-        auto_out_hours="Auto clock-out after this many hours if user forgets (default 12, 0 to disable)"
+        auto_out_hours="Auto clock-out after this many hours if user forgets (default 12, 0 to disable)",
+        default_break_minutes="Default break allowance per workday in minutes (default 60)",
+        blocked_weekdays="Comma-separated blocked clock-in days (default sat)"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def overtime_config(
@@ -199,14 +217,24 @@ class Admin(commands.Cog):
         interaction: discord.Interaction,
         daily_hours: float = 8.0,
         weekly_hours: float = 40.0,
-        auto_out_hours: float = 12.0
+        auto_out_hours: float = 12.0,
+        default_break_minutes: float = 60.0,
+        blocked_weekdays: str = "sat"
     ):
         if daily_hours <= 0 or weekly_hours <= 0:
             await interaction.response.send_message("❌ Hours must be positive.", ephemeral=True)
             return
+        if default_break_minutes < 0:
+            await interaction.response.send_message("❌ Default break minutes cannot be negative.", ephemeral=True)
+            return
         
         await self.db.set_overtime_config(
             str(interaction.guild_id), daily_hours, weekly_hours, auto_out_hours
+        )
+        await self.db.set_work_rules(
+            str(interaction.guild_id),
+            default_break_minutes=default_break_minutes,
+            blocked_weekdays=blocked_weekdays
         )
         
         embed = discord.Embed(title="⚡ Overtime Config Updated", color=0x57F287)
@@ -217,6 +245,8 @@ class Admin(commands.Cog):
             value=f"`{auto_out_hours}h`" if auto_out_hours > 0 else "Disabled",
             inline=True
         )
+        embed.add_field(name="Default Break", value=f"`{default_break_minutes} min`", inline=True)
+        embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(blocked_weekdays), inline=True)
         embed.set_footer(text="Overtime = worked hours − daily_hours × days_worked")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

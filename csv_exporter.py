@@ -66,8 +66,7 @@ class CSVExporter:
         """Export per-employee summary with overtime."""
         entries = await self.db.get_all_entries_range(guild_id, start, end)
         config = await self.db.get_overtime_config(guild_id)
-        
-        # Group by user
+
         users: Dict[str, Dict] = {}
         for e in entries:
             uid = e["user_id"]
@@ -75,19 +74,15 @@ class CSVExporter:
                 users[uid] = {
                     "username": e["username"],
                     "user_id": uid,
-                    "total_minutes": 0,
-                    "days_worked": set(),
                     "entry_count": 0
                 }
-            if e["clock_out"]:
-                users[uid]["total_minutes"] += e["duration_minutes"] or 0
-                users[uid]["days_worked"].add(e["clock_in"][:10])
             users[uid]["entry_count"] += 1
         
         rows = []
         for uid, u in users.items():
-            days = len(u["days_worked"])
-            total_mins = u["total_minutes"]
+            summary = await self.db.get_user_summary(guild_id, uid, start, end)
+            days = summary["days_worked"]
+            total_mins = summary["total_minutes"]
             expected_mins = config["daily_hours"] * 60 * days
             overtime_mins = max(0, total_mins - expected_mins)
             
@@ -100,7 +95,8 @@ class CSVExporter:
                 "Expected Hours": fmt_duration(int(expected_mins)),
                 "Overtime": fmt_duration(overtime_mins),
                 "Overtime Minutes": overtime_mins,
-                "Sessions": u["entry_count"]
+                "Sessions": u["entry_count"],
+                "Break Minutes": summary["break_minutes"]
             })
         
         rows.sort(key=lambda x: x["Employee"].lower())
@@ -109,7 +105,7 @@ class CSVExporter:
         filename = f"summary_{period}_{start.strftime('%Y%m%d')}_{ts}.csv"
         return self._write_csv(filename, rows, [
             "Employee", "User ID", "Days Worked", "Total Hours", "Total Minutes",
-            "Expected Hours", "Overtime", "Overtime Minutes", "Sessions"
+            "Expected Hours", "Overtime", "Overtime Minutes", "Sessions", "Break Minutes"
         ])
 
     async def export_leave(self, guild_id: str, status: str = None) -> str:

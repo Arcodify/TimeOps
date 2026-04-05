@@ -6,12 +6,63 @@ All tables: time_entries, leave_requests, standup_schedules, overtime_config
 import aiosqlite
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import os
 
 log = logging.getLogger("Database")
 DB_PATH = "data/hrbot.db"
+
+WEEKDAY_ALIASES = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tues": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
+
+
+def parse_blocked_weekdays(value) -> List[int]:
+    if value is None:
+        return [5]
+
+    if isinstance(value, (list, tuple, set)):
+        tokens = [str(v) for v in value]
+    else:
+        tokens = re.split(r"[,\s]+", str(value).strip())
+
+    days: List[int] = []
+    for token in tokens:
+        if not token:
+            continue
+        raw = token.strip().lower()
+        if raw.isdigit():
+            idx = int(raw)
+        else:
+            idx = WEEKDAY_ALIASES.get(raw)
+        if idx is None or idx < 0 or idx > 6:
+            continue
+        if idx not in days:
+            days.append(idx)
+
+    return days or [5]
+
+
+def normalize_blocked_weekdays(value) -> str:
+    return ",".join(str(day) for day in parse_blocked_weekdays(value))
 
 
 class Database:
@@ -75,6 +126,24 @@ class Database:
                     admin_role_id TEXT,
                     timezone    TEXT DEFAULT 'UTC'
                 );
+
+                CREATE TABLE IF NOT EXISTS work_rules (
+                    guild_id    TEXT PRIMARY KEY,
+                    default_break_minutes REAL DEFAULT 60.0,
+                    blocked_weekdays TEXT DEFAULT '5'
+                );
+
+                CREATE TABLE IF NOT EXISTS break_entries (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id    TEXT NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    username    TEXT NOT NULL,
+                    time_entry_id INTEGER,
+                    break_start TEXT NOT NULL,
+                    break_end   TEXT,
+                    duration_minutes INTEGER,
+                    break_type  TEXT DEFAULT 'break'
+                );
             """)
             await db.commit()
         log.info("Database initialized")
@@ -116,6 +185,7 @@ class Database:
         
         return {
             "success": True,
+            "entry_id": active["id"],
             "duration_minutes": duration,
             "clock_in": active["clock_in"],
             "clock_out": now.isoformat(),
@@ -190,13 +260,21 @@ class Database:
         """Total minutes worked, overtime, entry count for range."""
         entries = await self.get_entries_range(guild_id, user_id, start, end)
         config = await self.get_overtime_config(guild_id)
+        rules = await self.get_work_rules(guild_id)
         
-        total_minutes = sum(e["duration_minutes"] or 0 for e in entries if e["clock_out"])
+        gross_minutes = sum(e["duration_minutes"] or 0 for e in entries if e["clock_out"])
         days_worked = len(set(e["clock_in"][:10] for e in entries))
+        break_minutes = await self.get_break_minutes_for_range(guild_id, user_id, start, end)
+        default_break_minutes = float(rules.get("default_break_minutes") or 0)
+        expected_break_minutes = int(default_break_minutes * days_worked)
+        applied_break_minutes = max(break_minutes, expected_break_minutes)
+        total_minutes = max(0, gross_minutes - applied_break_minutes)
         expected_minutes = config["daily_hours"] * 60 * days_worked
         overtime_minutes = max(0, total_minutes - expected_minutes)
         
         return {
+            "gross_minutes": gross_minutes,
+            "break_minutes": applied_break_minutes,
             "total_minutes": total_minutes,
             "overtime_minutes": overtime_minutes,
             "days_worked": days_worked,
@@ -309,6 +387,53 @@ class Database:
                 "INSERT OR REPLACE INTO overtime_config (guild_id, daily_hours, weekly_hours, auto_out_hours) "
                 "VALUES (?,?,?,?)",
                 (guild_id, daily_hours, weekly_hours, auto_out_hours)
+            )
+            await db.commit()
+
+    async def get_break_minutes_for_entry(self, entry_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(duration_minutes), 0) FROM break_entries WHERE time_entry_id=? AND break_end IS NOT NULL",
+                (entry_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row[0] or 0)
+
+    async def get_break_minutes_for_range(self, guild_id: str, user_id: str, start: datetime, end: datetime) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT te.clock_in, COALESCE(be.duration_minutes, 0) AS duration_minutes "
+                "FROM break_entries be "
+                "JOIN time_entries te ON te.id = be.time_entry_id "
+                "WHERE te.guild_id=? AND te.user_id=? AND te.clock_in >= ? AND te.clock_in < ? "
+                "AND be.break_end IS NOT NULL",
+                (guild_id, user_id, start.isoformat(), end.isoformat())
+            ) as cur:
+                rows = await cur.fetchall()
+
+        return sum(int(row[1] or 0) for row in rows)
+
+    async def get_work_rules(self, guild_id: str) -> Dict:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM work_rules WHERE guild_id=?", (guild_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            data = dict(row)
+            data["blocked_weekdays"] = normalize_blocked_weekdays(data.get("blocked_weekdays"))
+            return data
+        return {
+            "guild_id": guild_id,
+            "default_break_minutes": 60.0,
+            "blocked_weekdays": "5",
+        }
+
+    async def set_work_rules(self, guild_id: str, default_break_minutes: float = 60.0, blocked_weekdays: str = "5"):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO work_rules (guild_id, default_break_minutes, blocked_weekdays) "
+                "VALUES (?,?,?)",
+                (guild_id, default_break_minutes, normalize_blocked_weekdays(blocked_weekdays))
             )
             await db.commit()
 
