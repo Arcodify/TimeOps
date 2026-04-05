@@ -1,0 +1,335 @@
+"""
+Database layer — SQLite via aiosqlite
+All tables: time_entries, leave_requests, standup_schedules, overtime_config
+"""
+
+import aiosqlite
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict
+import os
+
+log = logging.getLogger("Database")
+DB_PATH = "data/hrbot.db"
+
+
+class Database:
+    def __init__(self):
+        self.path = DB_PATH
+
+    async def init(self):
+        os.makedirs("data", exist_ok=True)
+        async with aiosqlite.connect(self.path) as db:
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS time_entries (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id    TEXT NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    username    TEXT NOT NULL,
+                    clock_in    TEXT NOT NULL,
+                    clock_out   TEXT,
+                    duration_minutes INTEGER,
+                    auto_out    INTEGER DEFAULT 0,
+                    note        TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS leave_requests (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id    TEXT NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    username    TEXT NOT NULL,
+                    leave_type  TEXT NOT NULL,
+                    start_date  TEXT NOT NULL,
+                    end_date    TEXT NOT NULL,
+                    reason      TEXT,
+                    status      TEXT DEFAULT 'pending',
+                    approver_id TEXT,
+                    approver_name TEXT,
+                    created_at  TEXT NOT NULL,
+                    message_id  TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS standup_schedules (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id    TEXT NOT NULL,
+                    channel_id  TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    cron_time   TEXT NOT NULL,
+                    message     TEXT NOT NULL,
+                    active      INTEGER DEFAULT 1,
+                    ping_role   TEXT,
+                    last_sent   TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS overtime_config (
+                    guild_id    TEXT PRIMARY KEY,
+                    daily_hours REAL DEFAULT 8.0,
+                    weekly_hours REAL DEFAULT 40.0,
+                    auto_out_hours REAL DEFAULT 12.0
+                );
+
+                CREATE TABLE IF NOT EXISTS guild_config (
+                    guild_id    TEXT PRIMARY KEY,
+                    leave_channel_id TEXT,
+                    admin_role_id TEXT,
+                    timezone    TEXT DEFAULT 'UTC'
+                );
+            """)
+            await db.commit()
+        log.info("Database initialized")
+
+    # ─── CONNECT / DISCONNECT ────────────────────────────────────────────────
+
+    async def clock_in(self, guild_id: str, user_id: str, username: str, note: str = None) -> Dict:
+        """Clock a user in. Returns error if already clocked in."""
+        active = await self.get_active_entry(guild_id, user_id)
+        if active:
+            return {"success": False, "error": "already_clocked_in", "entry": active}
+        
+        now = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO time_entries (guild_id, user_id, username, clock_in, note) VALUES (?,?,?,?,?)",
+                (guild_id, user_id, username, now, note)
+            )
+            await db.commit()
+            entry_id = cursor.lastrowid
+        return {"success": True, "entry_id": entry_id, "clock_in": now}
+
+    async def clock_out(self, guild_id: str, user_id: str, auto: bool = False) -> Dict:
+        """Clock a user out. Returns duration."""
+        active = await self.get_active_entry(guild_id, user_id)
+        if not active:
+            return {"success": False, "error": "not_clocked_in"}
+        
+        now = datetime.utcnow()
+        clock_in = datetime.fromisoformat(active["clock_in"])
+        duration = int((now - clock_in).total_seconds() / 60)  # minutes
+        
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE time_entries SET clock_out=?, duration_minutes=?, auto_out=? WHERE id=?",
+                (now.isoformat(), duration, 1 if auto else 0, active["id"])
+            )
+            await db.commit()
+        
+        return {
+            "success": True,
+            "duration_minutes": duration,
+            "clock_in": active["clock_in"],
+            "clock_out": now.isoformat(),
+            "auto": auto
+        }
+
+    async def get_active_entry(self, guild_id: str, user_id: str) -> Optional[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM time_entries WHERE guild_id=? AND user_id=? AND clock_out IS NULL",
+                (guild_id, user_id)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def auto_checkout_overdue(self, bot):
+        """Auto clock-out anyone clocked in beyond the configured limit."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT te.*, oc.auto_out_hours FROM time_entries te "
+                "LEFT JOIN overtime_config oc ON te.guild_id = oc.guild_id "
+                "WHERE te.clock_out IS NULL"
+            ) as cur:
+                rows = await cur.fetchall()
+        
+        for row in rows:
+            row = dict(row)
+            limit_hours = row.get("auto_out_hours") or 12.0
+            clock_in = datetime.fromisoformat(row["clock_in"])
+            if (datetime.utcnow() - clock_in).total_seconds() / 3600 >= limit_hours:
+                result = await self.clock_out(row["guild_id"], row["user_id"], auto=True)
+                log.info(f"Auto clock-out: {row['username']} after {limit_hours}h")
+                # Attempt to notify user
+                try:
+                    user = await bot.fetch_user(int(row["user_id"]))
+                    await user.send(
+                        f"⏰ **Auto Clock-Out Notice**\n"
+                        f"You were automatically clocked out after **{limit_hours:.0f} hours**.\n"
+                        f"Duration: **{result['duration_minutes']//60}h {result['duration_minutes']%60}m**\n"
+                        f"Use `/clockin` to clock back in."
+                    )
+                except Exception:
+                    pass
+
+    # ─── QUERIES ─────────────────────────────────────────────────────────────
+
+    async def get_entries_range(self, guild_id: str, user_id: str, start: datetime, end: datetime) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM time_entries WHERE guild_id=? AND user_id=? "
+                "AND clock_in >= ? AND clock_in < ? ORDER BY clock_in ASC",
+                (guild_id, user_id, start.isoformat(), end.isoformat())
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_all_entries_range(self, guild_id: str, start: datetime, end: datetime) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM time_entries WHERE guild_id=? "
+                "AND clock_in >= ? AND clock_in < ? ORDER BY username, clock_in ASC",
+                (guild_id, start.isoformat(), end.isoformat())
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_user_summary(self, guild_id: str, user_id: str, start: datetime, end: datetime) -> Dict:
+        """Total minutes worked, overtime, entry count for range."""
+        entries = await self.get_entries_range(guild_id, user_id, start, end)
+        config = await self.get_overtime_config(guild_id)
+        
+        total_minutes = sum(e["duration_minutes"] or 0 for e in entries if e["clock_out"])
+        days_worked = len(set(e["clock_in"][:10] for e in entries))
+        expected_minutes = config["daily_hours"] * 60 * days_worked
+        overtime_minutes = max(0, total_minutes - expected_minutes)
+        
+        return {
+            "total_minutes": total_minutes,
+            "overtime_minutes": overtime_minutes,
+            "days_worked": days_worked,
+            "entry_count": len(entries),
+            "entries": entries
+        }
+
+    # ─── LEAVE REQUESTS ──────────────────────────────────────────────────────
+
+    async def create_leave_request(self, guild_id, user_id, username, leave_type, 
+                                    start_date, end_date, reason) -> int:
+        now = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO leave_requests (guild_id, user_id, username, leave_type, "
+                "start_date, end_date, reason, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (guild_id, user_id, username, leave_type, start_date, end_date, reason, now)
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_leave_status(self, request_id: int, status: str, approver_id: str, approver_name: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE leave_requests SET status=?, approver_id=?, approver_name=? WHERE id=?",
+                (status, approver_id, approver_name, request_id)
+            )
+            await db.commit()
+
+    async def set_leave_message_id(self, request_id: int, message_id: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE leave_requests SET message_id=? WHERE id=?", (message_id, request_id))
+            await db.commit()
+
+    async def get_leave_requests(self, guild_id: str, status: str = None, user_id: str = None) -> List[Dict]:
+        query = "SELECT * FROM leave_requests WHERE guild_id=?"
+        params = [guild_id]
+        if status:
+            query += " AND status=?"
+            params.append(status)
+        if user_id:
+            query += " AND user_id=?"
+            params.append(user_id)
+        query += " ORDER BY created_at DESC"
+        
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── STANDUP ─────────────────────────────────────────────────────────────
+
+    async def add_standup(self, guild_id, channel_id, name, cron_time, message, ping_role=None) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO standup_schedules (guild_id, channel_id, name, cron_time, message, ping_role) "
+                "VALUES (?,?,?,?,?,?)",
+                (guild_id, channel_id, name, cron_time, message, ping_role)
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_standups(self, guild_id: str, active_only=True) -> List[Dict]:
+        query = "SELECT * FROM standup_schedules WHERE guild_id=?"
+        if active_only:
+            query += " AND active=1"
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (guild_id,)) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_all_active_standups(self) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM standup_schedules WHERE active=1") as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_standup_last_sent(self, standup_id: int, when: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE standup_schedules SET last_sent=? WHERE id=?", (when, standup_id))
+            await db.commit()
+
+    async def toggle_standup(self, standup_id: int, active: bool):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE standup_schedules SET active=? WHERE id=?", (1 if active else 0, standup_id))
+            await db.commit()
+
+    async def delete_standup(self, standup_id: int):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM standup_schedules WHERE id=?", (standup_id,))
+            await db.commit()
+
+    # ─── OVERTIME CONFIG ─────────────────────────────────────────────────────
+
+    async def get_overtime_config(self, guild_id: str) -> Dict:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM overtime_config WHERE guild_id=?", (guild_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {"guild_id": guild_id, "daily_hours": 8.0, "weekly_hours": 40.0, "auto_out_hours": 12.0}
+
+    async def set_overtime_config(self, guild_id: str, daily_hours: float, weekly_hours: float, auto_out_hours: float):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO overtime_config (guild_id, daily_hours, weekly_hours, auto_out_hours) "
+                "VALUES (?,?,?,?)",
+                (guild_id, daily_hours, weekly_hours, auto_out_hours)
+            )
+            await db.commit()
+
+    # ─── GUILD CONFIG ────────────────────────────────────────────────────────
+
+    async def get_guild_config(self, guild_id: str) -> Dict:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM guild_config WHERE guild_id=?", (guild_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {"guild_id": guild_id, "leave_channel_id": None, "admin_role_id": None, "timezone": "UTC"}
+
+    async def set_guild_config(self, guild_id: str, **kwargs):
+        existing = await self.get_guild_config(guild_id)
+        existing.update(kwargs)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO guild_config (guild_id, leave_channel_id, admin_role_id, timezone) "
+                "VALUES (?,?,?,?)",
+                (guild_id, existing.get("leave_channel_id"), existing.get("admin_role_id"), existing.get("timezone", "UTC"))
+            )
+            await db.commit()

@@ -1,0 +1,118 @@
+"""
+Admin Cog
+/hrsetup — configure leave channel, admin role, timezone
+/overtime config — set daily/weekly hours and auto-out limit
+"""
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import logging
+
+log = logging.getLogger("Admin")
+
+admin_group = app_commands.Group(name="hrconfig", description="HR Bot server configuration")
+overtime_group = app_commands.Group(name="overtime", description="Overtime configuration")
+
+
+class Admin(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.db = bot.db
+
+    @admin_group.command(name="setup", description="Configure HR bot for this server")
+    @app_commands.describe(
+        leave_channel="Channel for leave request notifications",
+        admin_role="Role that can approve leave and view admin reports",
+        timezone="Server timezone for display (e.g. UTC, US/Eastern, Asia/Kathmandu)"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def hrsetup(
+        self,
+        interaction: discord.Interaction,
+        leave_channel: discord.TextChannel = None,
+        admin_role: discord.Role = None,
+        timezone: str = "UTC"
+    ):
+        await self.db.set_guild_config(
+            str(interaction.guild_id),
+            leave_channel_id=str(leave_channel.id) if leave_channel else None,
+            admin_role_id=str(admin_role.id) if admin_role else None,
+            timezone=timezone
+        )
+        
+        embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
+        embed.add_field(name="Leave Channel", value=leave_channel.mention if leave_channel else "Not set", inline=True)
+        embed.add_field(name="Admin Role", value=admin_role.mention if admin_role else "Not set", inline=True)
+        embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
+        embed.set_footer(text="Use /hrconfig overtime to set work hour policies")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @admin_group.command(name="view", description="View current HR bot configuration")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def hrview(self, interaction: discord.Interaction):
+        config = await self.db.get_guild_config(str(interaction.guild_id))
+        ot_config = await self.db.get_overtime_config(str(interaction.guild_id))
+        
+        embed = discord.Embed(title="⚙️ HR Bot Configuration", color=0x5865F2)
+        
+        leave_ch = config.get("leave_channel_id")
+        embed.add_field(
+            name="Leave Channel",
+            value=f"<#{leave_ch}>" if leave_ch else "Not configured",
+            inline=True
+        )
+        
+        admin_r = config.get("admin_role_id")
+        embed.add_field(
+            name="Admin Role",
+            value=f"<@&{admin_r}>" if admin_r else "Not configured",
+            inline=True
+        )
+        
+        embed.add_field(name="Timezone", value=f"`{config.get('timezone', 'UTC')}`", inline=True)
+        embed.add_field(name="Daily Work Hours", value=f"`{ot_config['daily_hours']}h`", inline=True)
+        embed.add_field(name="Weekly Work Hours", value=f"`{ot_config['weekly_hours']}h`", inline=True)
+        embed.add_field(name="Auto Clock-Out After", value=f"`{ot_config['auto_out_hours']}h`", inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @overtime_group.command(name="config", description="Configure overtime and auto clock-out rules")
+    @app_commands.describe(
+        daily_hours="Standard work hours per day (default 8)",
+        weekly_hours="Standard work hours per week (default 40)",
+        auto_out_hours="Auto clock-out after this many hours if user forgets (default 12, 0 to disable)"
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def overtime_config(
+        self,
+        interaction: discord.Interaction,
+        daily_hours: float = 8.0,
+        weekly_hours: float = 40.0,
+        auto_out_hours: float = 12.0
+    ):
+        if daily_hours <= 0 or weekly_hours <= 0:
+            await interaction.response.send_message("❌ Hours must be positive.", ephemeral=True)
+            return
+        
+        await self.db.set_overtime_config(
+            str(interaction.guild_id), daily_hours, weekly_hours, auto_out_hours
+        )
+        
+        embed = discord.Embed(title="⚡ Overtime Config Updated", color=0x57F287)
+        embed.add_field(name="Daily Hours", value=f"`{daily_hours}h`", inline=True)
+        embed.add_field(name="Weekly Hours", value=f"`{weekly_hours}h`", inline=True)
+        embed.add_field(
+            name="Auto Clock-Out",
+            value=f"`{auto_out_hours}h`" if auto_out_hours > 0 else "Disabled",
+            inline=True
+        )
+        embed.set_footer(text="Overtime = worked hours − daily_hours × days_worked")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def setup(bot):
+    cog = Admin(bot)
+    bot.tree.add_command(admin_group)
+    bot.tree.add_command(overtime_group)
+    await bot.add_cog(cog)
