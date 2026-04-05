@@ -41,13 +41,15 @@ async def on_ready():
     try:
         if SYNC_GUILD_ID:
             guild = discord.Object(id=int(SYNC_GUILD_ID))
-            # 1. Wipe ALL guild commands (removes stale `setup`, etc.)
+
+            # Phase 1: push EMPTY command list to Discord to nuke stale commands
             bot.tree.clear_commands(guild=guild)
-            # 2. Wipe global commands too (so copy_global_to starts clean)
+            await bot.tree.sync(guild=guild)
+            log.info("Cleared all guild commands from Discord")
+
+            # Phase 2: reload all cog commands into tree, then push
             bot.tree.clear_commands(guild=None)
-            # 3. Copy current in-memory commands to guild
             bot.tree.copy_global_to(guild=guild)
-            # 4. Push the clean set to Discord
             synced = await bot.tree.sync(guild=guild)
             log.info(f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}")
         else:
