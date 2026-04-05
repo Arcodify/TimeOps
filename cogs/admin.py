@@ -52,14 +52,14 @@ class Admin(commands.Cog):
 
         return channel
 
-    @admin_group.command(name="setup", description="Configure HR bot for this server")
+    @admin_group.command(name="configure", description="Configure HR bot for this server")
     @app_commands.describe(
         leave_channel="Text channel or thread for leave request notifications",
         admin_role="Role that can approve leave and view admin reports",
         timezone="Server timezone for display (e.g. UTC, US/Eastern, Asia/Kathmandu)"
     )
     @app_commands.checks.has_permissions(administrator=True)
-    async def hrsetup(
+    async def hrconfigure(
         self,
         interaction: discord.Interaction,
         leave_channel: discord.app_commands.AppCommandChannel = None,
