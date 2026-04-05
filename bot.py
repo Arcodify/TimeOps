@@ -14,13 +14,13 @@ from database import Database
 from scheduler import StandupScheduler
 
 load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.FileHandler("logs/bot.log"), logging.StreamHandler()],
 )
 log = logging.getLogger("HRBot")
+
 SYNC_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
 intents = discord.Intents.default()
@@ -29,44 +29,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 db = Database()
-bot.db = db  # attach to bot so all cogs share the same instance
+bot.db = db
 standup_scheduler = StandupScheduler(db)
 
 
-@bot.event
-async def on_ready():
-    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    standup_scheduler.set_bot(bot)
-    log.info("Bot ready")
-
-    if not auto_checkout_loop.is_running():
-        auto_checkout_loop.start()
-    if not standup_check_loop.is_running():
-        standup_check_loop.start()
-    if not daily_export_loop.is_running():
-        daily_export_loop.start()
-    log.info("Background tasks started")
-
-
 # ─── BACKGROUND TASKS ────────────────────────────────────────────────────────
-
-
 @tasks.loop(minutes=5)
 async def auto_checkout_loop():
-    """Auto clock-out users who have been clocked in too long."""
     await db.auto_checkout_overdue(bot)
 
 
 @tasks.loop(minutes=1)
 async def standup_check_loop():
-    """Check and trigger standup messages."""
     await standup_scheduler.check_and_send()
 
 
 @tasks.loop(hours=1)
 async def daily_export_loop():
-    """Auto-export CSVs at midnight."""
-    from datetime import datetime, time as dtime
+    from datetime import datetime
 
     now = datetime.now()
     if now.hour == 0 and now.minute < 5:
@@ -77,12 +57,11 @@ async def daily_export_loop():
         log.info("Auto daily CSV export completed")
 
 
-# ─── LOAD COGS ────────────────────────────────────────────────────────────────
-
-
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     async with bot:
         await db.init()
+
         for ext in [
             "cogs.timeclock",
             "cogs.leave",
@@ -96,22 +75,34 @@ async def main():
         ]:
             await bot.load_extension(ext)
 
-        # Sync AFTER cogs are loaded so all commands are registered
-        async with bot:
-            await bot.login(os.getenv("DISCORD_TOKEN"))
+        # on_ready defined here so cogs are already loaded when it fires
+        @bot.event
+        async def on_ready():
+            log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+            standup_scheduler.set_bot(bot)
 
-            if SYNC_GUILD_ID:
-                guild = discord.Object(id=int(SYNC_GUILD_ID))
-                # Phase 1: clear
-                bot.tree.clear_commands(guild=guild)
-                await bot.http.bulk_upsert_guild_commands(
-                    bot.application_id, int(SYNC_GUILD_ID), []
-                )
-                log.info("Cleared all guild commands")
-                # Phase 2: sync fresh
-                bot.tree.copy_global_to(guild=guild)
-                synced = await bot.tree.sync(guild=guild)
-                log.info(f"Synced {len(synced)} commands")
+            try:
+                if SYNC_GUILD_ID:
+                    guild = discord.Object(id=int(SYNC_GUILD_ID))
+                    bot.tree.clear_commands(guild=guild)
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    log.info(
+                        f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}"
+                    )
+                else:
+                    synced = await bot.tree.sync()
+                    log.info(f"Synced {len(synced)} slash commands globally")
+            except Exception as e:
+                log.error(f"Failed to sync commands: {e}")
+
+            if not auto_checkout_loop.is_running():
+                auto_checkout_loop.start()
+            if not standup_check_loop.is_running():
+                standup_check_loop.start()
+            if not daily_export_loop.is_running():
+                daily_export_loop.start()
+            log.info("Background tasks started")
 
         await bot.start(os.getenv("DISCORD_TOKEN"))
 
