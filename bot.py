@@ -94,6 +94,7 @@ async def main():
             "cogs.breaks",
             "cogs.holidays",
             "cogs.reminders",
+            "cogs.updates",
             "cogs.help",
         ]:
             await bot.load_extension(ext)

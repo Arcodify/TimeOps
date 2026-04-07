@@ -124,6 +124,8 @@ class Database:
                     guild_id    TEXT PRIMARY KEY,
                     leave_channel_id TEXT,
                     admin_role_id TEXT,
+                    present_role_id TEXT,
+                    on_break_role_id TEXT,
                     timezone    TEXT DEFAULT 'UTC'
                 );
 
@@ -144,7 +146,53 @@ class Database:
                     duration_minutes INTEGER,
                     break_type  TEXT DEFAULT 'break'
                 );
+
+                CREATE TABLE IF NOT EXISTS work_update_config (
+                    guild_id        TEXT PRIMARY KEY,
+                    enabled         INTEGER DEFAULT 0,
+                    interval_hours  REAL DEFAULT 2.0,
+                    question_text   TEXT DEFAULT 'What did you work on?',
+                    archive_channel_id TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS work_updates (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id        TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    username        TEXT NOT NULL,
+                    time_entry_id   INTEGER NOT NULL,
+                    prompt_slot     INTEGER NOT NULL,
+                    prompted_at     TEXT NOT NULL,
+                    question_text   TEXT,
+                    submitted_at    TEXT,
+                    content         TEXT,
+                    UNIQUE(time_entry_id, prompt_slot)
+                );
             """)
+            columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(guild_config)")).fetchall()
+            }
+            if "present_role_id" not in columns:
+                await db.execute("ALTER TABLE guild_config ADD COLUMN present_role_id TEXT")
+            if "on_break_role_id" not in columns:
+                await db.execute("ALTER TABLE guild_config ADD COLUMN on_break_role_id TEXT")
+            update_config_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(work_update_config)")).fetchall()
+            }
+            if "question_text" not in update_config_columns:
+                await db.execute(
+                    "ALTER TABLE work_update_config ADD COLUMN question_text TEXT DEFAULT 'What did you work on?'"
+                )
+            if "archive_channel_id" not in update_config_columns:
+                await db.execute("ALTER TABLE work_update_config ADD COLUMN archive_channel_id TEXT")
+            work_updates_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(work_updates)")).fetchall()
+            }
+            if "question_text" not in work_updates_columns:
+                await db.execute("ALTER TABLE work_updates ADD COLUMN question_text TEXT")
             await db.commit()
         log.info("Database initialized")
 
@@ -202,6 +250,16 @@ class Database:
                 row = await cur.fetchone()
                 return dict(row) if row else None
 
+    async def get_active_entries_for_guild(self, guild_id: str) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM time_entries WHERE guild_id=? AND clock_out IS NULL ORDER BY clock_in ASC",
+                (guild_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
     async def auto_checkout_overdue(self, bot):
         """Auto clock-out anyone clocked in beyond the configured limit."""
         async with aiosqlite.connect(self.path) as db:
@@ -229,6 +287,29 @@ class Database:
                         f"Duration: **{result['duration_minutes']//60}h {result['duration_minutes']%60}m**\n"
                         f"Use `/clockin` to clock back in."
                     )
+                except Exception:
+                    pass
+
+                try:
+                    config = await self.get_guild_config(row["guild_id"])
+                    present_role_id = config.get("present_role_id")
+                    role_id = config.get("on_break_role_id")
+                    guild = bot.get_guild(int(row["guild_id"]))
+                    if guild and present_role_id:
+                        member = guild.get_member(int(row["user_id"]))
+                        if member is None:
+                            member = await guild.fetch_member(int(row["user_id"]))
+                        role = guild.get_role(int(present_role_id))
+                        if member and role and role in member.roles:
+                            await member.remove_roles(role, reason="Auto clock-out removed present role")
+                    if role_id:
+                        if guild:
+                            member = guild.get_member(int(row["user_id"]))
+                            if member is None:
+                                member = await guild.fetch_member(int(row["user_id"]))
+                            role = guild.get_role(int(role_id))
+                            if member and role and role in member.roles:
+                                await member.remove_roles(role, reason="Auto clock-out removed on-break role")
                 except Exception:
                     pass
 
@@ -446,15 +527,172 @@ class Database:
                 row = await cur.fetchone()
         if row:
             return dict(row)
-        return {"guild_id": guild_id, "leave_channel_id": None, "admin_role_id": None, "timezone": "UTC"}
+        return {
+            "guild_id": guild_id,
+            "leave_channel_id": None,
+            "admin_role_id": None,
+            "present_role_id": None,
+            "on_break_role_id": None,
+            "timezone": "UTC",
+        }
 
     async def set_guild_config(self, guild_id: str, **kwargs):
         existing = await self.get_guild_config(guild_id)
         existing.update(kwargs)
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO guild_config (guild_id, leave_channel_id, admin_role_id, timezone) "
-                "VALUES (?,?,?,?)",
-                (guild_id, existing.get("leave_channel_id"), existing.get("admin_role_id"), existing.get("timezone", "UTC"))
+                "INSERT OR REPLACE INTO guild_config (guild_id, leave_channel_id, admin_role_id, present_role_id, on_break_role_id, timezone) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    guild_id,
+                    existing.get("leave_channel_id"),
+                    existing.get("admin_role_id"),
+                    existing.get("present_role_id"),
+                    existing.get("on_break_role_id"),
+                    existing.get("timezone", "UTC"),
+                )
             )
             await db.commit()
+
+    async def get_work_update_config(self, guild_id: str) -> Dict:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM work_update_config WHERE guild_id=?", (guild_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            return dict(row)
+        return {
+            "guild_id": guild_id,
+            "enabled": 0,
+            "interval_hours": 2.0,
+            "question_text": "What did you work on?",
+            "archive_channel_id": None,
+        }
+
+    async def set_work_update_config(
+        self,
+        guild_id: str,
+        enabled: bool,
+        interval_hours: float,
+        question_text: str,
+        archive_channel_id: str = None,
+    ):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO work_update_config
+                (guild_id, enabled, interval_hours, question_text, archive_channel_id)
+                VALUES (?,?,?,?,?)
+                """,
+                (guild_id, 1 if enabled else 0, interval_hours, question_text, archive_channel_id)
+            )
+            await db.commit()
+
+    async def get_enabled_work_update_configs(self) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM work_update_config WHERE enabled=1 AND interval_hours > 0"
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def ensure_work_update_prompt(
+        self,
+        guild_id: str,
+        user_id: str,
+        username: str,
+        time_entry_id: int,
+        prompt_slot: int,
+        question_text: str,
+    ) -> bool:
+        prompted_at = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO work_updates
+                (guild_id, user_id, username, time_entry_id, prompt_slot, prompted_at, question_text, submitted_at, content)
+                VALUES (?,?,?,?,?,?,?,NULL,NULL)
+                """,
+                (guild_id, user_id, username, time_entry_id, prompt_slot, prompted_at, question_text)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def submit_work_update(
+        self,
+        guild_id: str,
+        user_id: str,
+        username: str,
+        time_entry_id: int,
+        prompt_slot: int,
+        question_text: str,
+        content: str,
+    ):
+        submitted_at = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO work_updates
+                (guild_id, user_id, username, time_entry_id, prompt_slot, prompted_at, question_text, submitted_at, content)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(time_entry_id, prompt_slot)
+                DO UPDATE SET
+                    username=excluded.username,
+                    question_text=excluded.question_text,
+                    submitted_at=excluded.submitted_at,
+                    content=excluded.content
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    username,
+                    time_entry_id,
+                    prompt_slot,
+                    submitted_at,
+                    question_text,
+                    submitted_at,
+                    content,
+                )
+            )
+            await db.commit()
+
+    async def get_work_updates(
+        self,
+        guild_id: str,
+        start: datetime,
+        end: datetime,
+        user_id: str = None,
+        submitted_only: bool = True,
+    ) -> List[Dict]:
+        query = (
+            "SELECT * FROM work_updates WHERE guild_id=? AND prompted_at >= ? AND prompted_at < ?"
+        )
+        params = [guild_id, start.isoformat(), end.isoformat()]
+        if user_id:
+            query += " AND user_id=?"
+            params.append(user_id)
+        if submitted_only:
+            query += " AND submitted_at IS NOT NULL AND content IS NOT NULL"
+        query += " ORDER BY prompted_at ASC"
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_pending_work_update(self, guild_id: str, user_id: str, time_entry_id: int) -> Optional[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT * FROM work_updates
+                WHERE guild_id=? AND user_id=? AND time_entry_id=? AND submitted_at IS NULL
+                ORDER BY prompt_slot DESC
+                LIMIT 1
+                """,
+                (guild_id, user_id, time_entry_id)
+            ) as cur:
+                row = await cur.fetchone()
+        return dict(row) if row else None

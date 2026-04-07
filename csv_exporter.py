@@ -133,6 +133,46 @@ class CSVExporter:
             "Reason", "Status", "Approver", "Submitted At"
         ])
 
+    async def export_work_updates(
+        self,
+        guild_id: str,
+        period: str,
+        start: datetime,
+        end: datetime,
+        user_id: str = None,
+        label: str = "all",
+    ) -> str:
+        """Export submitted work updates for a period."""
+        updates = await self.db.get_work_updates(guild_id, start, end, user_id=user_id)
+
+        rows = []
+        for item in updates:
+            rows.append({
+                "Date": item["prompted_at"][:10],
+                "Employee": item["username"],
+                "User ID": item["user_id"],
+                "Prompt Slot": item["prompt_slot"],
+                "Prompted At": item["prompted_at"].replace("T", " ")[:19],
+                "Submitted At": (item.get("submitted_at") or "").replace("T", " ")[:19],
+                "Question": item.get("question_text") or "",
+                "Answer": item.get("content") or "",
+                "Time Entry ID": item["time_entry_id"],
+            })
+
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"work_updates_{label}_{period}_{start.strftime('%Y%m%d')}_{ts}.csv"
+        return self._write_csv(filename, rows, [
+            "Date",
+            "Employee",
+            "User ID",
+            "Prompt Slot",
+            "Prompted At",
+            "Submitted At",
+            "Question",
+            "Answer",
+            "Time Entry ID",
+        ])
+
     async def export_daily(self, guild_id: str = None) -> List[str]:
         """Export yesterday's timesheet for all guilds."""
         yesterday = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)

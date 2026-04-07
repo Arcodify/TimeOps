@@ -25,7 +25,7 @@ PAGES = [
         "title": "☕ Breaks",
         "color": 0xFEE75C,
         "fields": [
-            ("/break start [type]", "Start a break — Regular / Lunch / Personal"),
+            ("/break start [type]", "Start a manual break — can assign the configured On Break role"),
             ("/break end", "End your current break"),
             ("/break status", "View break history for your active session"),
         ]
@@ -59,6 +59,16 @@ PAGES = [
             ("/report summary [period]", "Per-employee summary + overtime CSV *(Admin)*"),
             ("/report overtime [period]", "Overtime overview embed *(Admin)*"),
             ("/report leave", "All leave requests CSV *(Admin)*"),
+            ("/report updates [period] [member]", "Work updates CSV for one employee or everyone *(Admin)*"),
+        ]
+    },
+    {
+        "title": "📝 Work Updates",
+        "color": 0x5865F2,
+        "fields": [
+            ("/update status", "View periodic work-update prompt settings"),
+            ("/update config [enabled] [interval_hours] [question] [archive_channel]", "Set prompt timing, question, and archive channel *(Admin)*"),
+            ("/update submit", "Submit your pending work update"),
         ]
     },
     {
@@ -84,7 +94,7 @@ PAGES = [
         "title": "⚙️ Admin Configuration",
         "color": 0x99AAB5,
         "fields": [
-            ("/hrconfig setup", "Set leave channel, admin role, timezone"),
+            ("/hrconfig configure", "Set leave channel, admin role, present role, on-break role, and timezone"),
             ("/hrconfig view", "View current bot configuration"),
             ("/overtime config", "Set daily/weekly hours, break allowance, and blocked clock-in days"),
         ]

@@ -245,62 +245,66 @@ leave_group = app_commands.Group(name="leave", description="Leave request manage
 class Leave(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.db = bot.db
 
-    @leave_group.command(name="request", description="Submit a leave request")
-    async def leave_request(self, interaction: discord.Interaction):
-        config = await self.db.get_guild_config(str(interaction.guild_id))
-        modal = LeaveRequestModal(self.db, config.get("leave_channel_id"))
-        await interaction.response.send_modal(modal)
 
-    @leave_group.command(name="list", description="View your leave requests")
-    async def leave_list(self, interaction: discord.Interaction):
-        requests = await self.db.get_leave_requests(
-            str(interaction.guild_id), user_id=str(interaction.user.id)
-        )
-        
-        if not requests:
-            await interaction.response.send_message("You have no leave requests.", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title=f"📋 Leave Requests — {interaction.user.display_name}",
-            color=0x5865F2,
-            timestamp=datetime.utcnow()
-        )
-        
-        for r in requests[:10]:
-            status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌"}.get(r["status"], "❓")
-            embed.add_field(
-                name=f"#{r['id']} — {r['leave_type']} {status_icon}",
-                value=f"`{r['start_date']}` → `{r['end_date']}`\n{r['status'].upper()}",
-                inline=True
-            )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+@leave_group.command(name="request", description="Submit a leave request")
+async def leave_request(interaction: discord.Interaction):
+    db = interaction.client.db
+    config = await db.get_guild_config(str(interaction.guild_id))
+    modal = LeaveRequestModal(db, config.get("leave_channel_id"))
+    await interaction.response.send_modal(modal)
 
-    @leave_group.command(name="pending", description="View all pending leave requests (Admin)")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def leave_pending(self, interaction: discord.Interaction):
-        requests = await self.db.get_leave_requests(str(interaction.guild_id), status="pending")
-        
-        if not requests:
-            await interaction.response.send_message("No pending leave requests! 🎉", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title=f"⏳ Pending Leave Requests ({len(requests)})",
-            color=0xFEE75C,
-            timestamp=datetime.utcnow()
+
+@leave_group.command(name="list", description="View your leave requests")
+async def leave_list(interaction: discord.Interaction):
+    db = interaction.client.db
+    requests = await db.get_leave_requests(
+        str(interaction.guild_id), user_id=str(interaction.user.id)
+    )
+
+    if not requests:
+        await interaction.response.send_message("You have no leave requests.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"📋 Leave Requests — {interaction.user.display_name}",
+        color=0x5865F2,
+        timestamp=datetime.utcnow()
+    )
+
+    for r in requests[:10]:
+        status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌"}.get(r["status"], "❓")
+        embed.add_field(
+            name=f"#{r['id']} — {r['leave_type']} {status_icon}",
+            value=f"`{r['start_date']}` → `{r['end_date']}`\n{r['status'].upper()}",
+            inline=True
         )
-        for r in requests[:15]:
-            embed.add_field(
-                name=f"#{r['id']} — {r['username']}",
-                value=f"**{r['leave_type']}**\n{r['start_date']} → {r['end_date']}",
-                inline=True
-            )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@leave_group.command(name="pending", description="View all pending leave requests (Admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def leave_pending(interaction: discord.Interaction):
+    requests = await interaction.client.db.get_leave_requests(str(interaction.guild_id), status="pending")
+
+    if not requests:
+        await interaction.response.send_message("No pending leave requests! 🎉", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"⏳ Pending Leave Requests ({len(requests)})",
+        color=0xFEE75C,
+        timestamp=datetime.utcnow()
+    )
+    for r in requests[:15]:
+        embed.add_field(
+            name=f"#{r['id']} — {r['username']}",
+            value=f"**{r['leave_type']}**\n{r['start_date']} → {r['end_date']}",
+            inline=True
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):
