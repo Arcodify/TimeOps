@@ -33,6 +33,29 @@ bot.db = db
 standup_scheduler = StandupScheduler(db)
 
 
+async def sync_app_commands() -> None:
+    if SYNC_GUILD_ID:
+        guild = discord.Object(id=int(SYNC_GUILD_ID))
+        application_id = bot.application_id
+        if application_id is None:
+            raise RuntimeError("Bot application ID is unavailable during command sync")
+
+        # Remove stale global command definitions so Discord cannot serve an
+        # outdated schema for the same command names while this bot is using
+        # guild-scoped sync for faster iteration.
+        await bot.http.bulk_upsert_global_commands(application_id, payload=[])
+        log.info("Cleared remote global slash commands before guild sync")
+
+        bot.tree.clear_commands(guild=guild)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info(f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}")
+        return
+
+    synced = await bot.tree.sync()
+    log.info(f"Synced {len(synced)} slash commands globally")
+
+
 # ─── BACKGROUND TASKS ────────────────────────────────────────────────────────
 @tasks.loop(minutes=5)
 async def auto_checkout_loop():
@@ -82,17 +105,7 @@ async def main():
             standup_scheduler.set_bot(bot)
 
             try:
-                if SYNC_GUILD_ID:
-                    guild = discord.Object(id=int(SYNC_GUILD_ID))
-                    bot.tree.clear_commands(guild=guild)
-                    bot.tree.copy_global_to(guild=guild)
-                    synced = await bot.tree.sync(guild=guild)
-                    log.info(
-                        f"Synced {len(synced)} slash commands to guild {SYNC_GUILD_ID}"
-                    )
-                else:
-                    synced = await bot.tree.sync()
-                    log.info(f"Synced {len(synced)} slash commands globally")
+                await sync_app_commands()
             except Exception as e:
                 log.error(f"Failed to sync commands: {e}")
 
