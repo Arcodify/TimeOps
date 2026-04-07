@@ -1,7 +1,7 @@
 """
 Standup Cog
 /standup add, /standup list, /standup delete, /standup toggle
-Supports multiple standups per guild, multiple fire times per standup
+Supports scheduled standup announcements with temporary voice rooms
 """
 
 import discord
@@ -25,8 +25,10 @@ class Standup(commands.Cog):
     name="Standup name (e.g. 'Morning Standup')",
     channel="Channel to post in",
     times="Time(s) in HH:MM UTC format, comma-separated for multiple (e.g. '09:00' or '09:00,14:00')",
-    message="The message to post",
-    ping_role="Optional role to ping"
+    message="Optional short text shown above the meeting links",
+    ping_role="Optional role to ping",
+    meeting_url="Optional external meeting URL (Google Meet, Zoom, etc.)",
+    voice_duration_minutes="How long the temporary voice room should stay available"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def standup_add(
@@ -34,8 +36,10 @@ async def standup_add(
     name: str,
     channel: discord.TextChannel,
     times: str,
-    message: str,
-    ping_role: discord.Role = None
+    message: str = "Standup is live. Join the meeting below.",
+    ping_role: discord.Role = None,
+    meeting_url: str = None,
+    voice_duration_minutes: app_commands.Range[int, 5, 180] = 20,
 ):
     db = interaction.client.db
 
@@ -56,7 +60,9 @@ async def standup_add(
         name=name,
         cron_time=times,
         message=message,
-        ping_role=str(ping_role.id) if ping_role else None
+        ping_role=str(ping_role.id) if ping_role else None,
+        meeting_url=meeting_url.strip() if meeting_url else None,
+        voice_duration_minutes=int(voice_duration_minutes),
     )
 
     embed = discord.Embed(
@@ -69,6 +75,8 @@ async def standup_add(
     embed.add_field(name="Channel", value=channel.mention, inline=True)
     embed.add_field(name="Times (UTC)", value="\n".join(f"`{t}`" for t in time_list), inline=True)
     embed.add_field(name="Ping Role", value=ping_role.mention if ping_role else "None", inline=True)
+    embed.add_field(name="Voice Room", value=f"`{voice_duration_minutes} min temporary room`", inline=True)
+    embed.add_field(name="Meeting URL", value=meeting_url if meeting_url else "Discord voice only", inline=False)
     embed.add_field(name="Message Preview", value=message[:200], inline=False)
 
     await interaction.response.send_message(embed=embed)
@@ -106,6 +114,8 @@ async def standup_list(interaction: discord.Interaction):
             value=(
                 f"📌 {ch_mention}\n"
                 f"⏰ `{s['cron_time']} UTC`\n"
+                f"🎙️ Temp room: `{int(s.get('voice_duration_minutes') or 20)} min`\n"
+                f"🔗 Meeting URL: {s.get('meeting_url') or 'Discord voice only'}\n"
                 f"📨 Last sent: `{last}`"
             ),
             inline=True
@@ -146,25 +156,13 @@ async def standup_test(interaction: discord.Interaction, standup_id: int):
         await interaction.response.send_message("❌ Standup not found.", ephemeral=True)
         return
 
-    channel = interaction.guild.get_channel(int(s["channel_id"]))
-    if not channel:
-        await interaction.response.send_message("❌ Channel not found.", ephemeral=True)
+    scheduler = getattr(interaction.client, "standup_scheduler", None)
+    if scheduler is None:
+        await interaction.response.send_message("❌ Standup scheduler is unavailable.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title=f"📢 {s['name']} (Test)",
-        description=s["message"],
-        color=0x5865F2,
-        timestamp=datetime.utcnow()
-    )
-    embed.set_footer(text="HR Bot • Standup Test")
-
-    content = None
-    if s.get("ping_role"):
-        content = f"<@&{s['ping_role']}>"
-
-    await channel.send(content=content, embed=embed)
-    await interaction.response.send_message(f"✅ Test standup sent to {channel.mention}!", ephemeral=True)
+    await scheduler._send_standup(s, update_last_sent=False)
+    await interaction.response.send_message("✅ Test standup sent with a temporary voice room.", ephemeral=True)
 
 
 async def setup(bot):

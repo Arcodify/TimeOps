@@ -46,11 +46,11 @@ PAGES = [
         "title": "📅 Standups",
         "color": 0xEB459E,
         "fields": [
-            ("/standup add", "Schedule a recurring standup *(Admin)*"),
+            ("/standup add", "Schedule a recurring standup with a temporary voice room *(Admin)*"),
             ("/standup list", "List all standup schedules"),
             ("/standup pause", "Pause or resume a standup *(Admin)*"),
             ("/standup delete", "Remove a standup schedule *(Admin)*"),
-            ("/standup test", "Fire a standup right now for testing *(Admin)*"),
+            ("/standup test", "Fire a standup now and create its temporary voice room *(Admin)*"),
         ]
     },
     {

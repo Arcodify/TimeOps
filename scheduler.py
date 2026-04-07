@@ -16,6 +16,7 @@ class StandupScheduler:
     def __init__(self, db):
         self.db = db
         self.bot = None
+        self.active_voice_rooms = {}
 
     def set_bot(self, bot):
         self.bot = bot
@@ -47,13 +48,61 @@ class StandupScheduler:
         """Called every minute. Sends any due standups."""
         if not self.bot:
             return
-        
+
+        await self._cleanup_voice_rooms()
         standups = await self.db.get_all_active_standups()
         for standup in standups:
             if self._should_send(standup):
                 await self._send_standup(standup)
 
-    async def _send_standup(self, standup: dict):
+    async def _cleanup_voice_rooms(self):
+        now = datetime.utcnow()
+        stale_ids = []
+        for channel_id, meta in self.active_voice_rooms.items():
+            guild = self.bot.get_guild(int(meta["guild_id"]))
+            channel = guild.get_channel(channel_id) if guild else None
+            if channel is None:
+                stale_ids.append(channel_id)
+                continue
+
+            cleanup_after = meta["cleanup_after"]
+            if now < cleanup_after:
+                continue
+            if channel.members:
+                continue
+
+            try:
+                await channel.delete(reason="Temporary standup room expired")
+                log.info("Deleted temporary standup room %s", channel_id)
+            except Exception as e:
+                log.warning("Failed to delete temporary standup room %s: %s", channel_id, e)
+            stale_ids.append(channel_id)
+
+        for channel_id in stale_ids:
+            self.active_voice_rooms.pop(channel_id, None)
+
+    async def _create_temp_voice_channel(self, standup: dict, text_channel: discord.abc.GuildChannel):
+        guild = text_channel.guild
+        category = getattr(text_channel, "category", None)
+        if category is None and hasattr(text_channel, "parent") and text_channel.parent is not None:
+            category = getattr(text_channel.parent, "category", None)
+
+        scheduled_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        voice_name = f"{standup['name']} • {scheduled_time}"
+        voice_duration_minutes = int(standup.get("voice_duration_minutes") or 20)
+        voice_channel = await guild.create_voice_channel(
+            name=voice_name[:100],
+            category=category,
+            reason=f"Temporary standup room for {standup['name']}",
+        )
+        self.active_voice_rooms[voice_channel.id] = {
+            "guild_id": str(guild.id),
+            "standup_id": standup["id"],
+            "cleanup_after": datetime.utcnow() + timedelta(minutes=voice_duration_minutes),
+        }
+        return voice_channel
+
+    async def _send_standup(self, standup: dict, *, update_last_sent: bool = True):
         try:
             channel = self.bot.get_channel(int(standup["channel_id"]))
             if not channel:
@@ -62,11 +111,23 @@ class StandupScheduler:
                 log.warning(f"Standup channel {standup['channel_id']} not found")
                 return
 
+            voice_channel = await self._create_temp_voice_channel(standup, channel)
+            voice_duration_minutes = int(standup.get("voice_duration_minutes") or 20)
+            description = standup["message"] or "Standup is live. Join the meeting below."
+
             embed = discord.Embed(
                 title=f"📢 {standup['name']}",
-                description=standup["message"],
+                description=description,
                 color=0x5865F2,
                 timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Discord Voice", value=voice_channel.mention, inline=False)
+            if standup.get("meeting_url"):
+                embed.add_field(name="Meeting URL", value=standup["meeting_url"], inline=False)
+            embed.add_field(
+                name="Availability",
+                value=f"Temporary voice room stays open for about `{voice_duration_minutes}` minutes.",
+                inline=False,
             )
             embed.set_footer(text="HR Bot • Standup")
 
@@ -75,7 +136,13 @@ class StandupScheduler:
                 content = f"<@&{standup['ping_role']}>"
 
             await channel.send(content=content or None, embed=embed)
-            await self.db.update_standup_last_sent(standup["id"], datetime.utcnow().isoformat())
-            log.info(f"Sent standup '{standup['name']}' to channel {standup['channel_id']}")
+            if update_last_sent:
+                await self.db.update_standup_last_sent(standup["id"], datetime.utcnow().isoformat())
+            log.info(
+                "Sent standup '%s' to channel %s with temporary voice room %s",
+                standup["name"],
+                standup["channel_id"],
+                voice_channel.id,
+            )
         except Exception as e:
             log.error(f"Failed to send standup {standup['id']}: {e}")

@@ -31,6 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 db = Database()
 bot.db = db
 standup_scheduler = StandupScheduler(db)
+bot.standup_scheduler = standup_scheduler
 
 
 async def sync_app_commands() -> None:

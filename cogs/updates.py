@@ -15,7 +15,41 @@ from discord.ext.tasks import loop
 log = logging.getLogger("Updates")
 
 update_group = app_commands.Group(name="update", description="Periodic work update prompts")
-DEFAULT_WORK_UPDATE_QUESTION = "What did you work on?"
+DEFAULT_WORK_UPDATE_QUESTION = "Share a short work update for this check-in."
+
+
+def _sanitize_update_value(value: str) -> str:
+    text = (value or "").strip()
+    return text or "—"
+
+
+def _compose_work_update_content(current_work: str, next_work: str, blockers: str) -> str:
+    return (
+        f"What are you working on?\n{_sanitize_update_value(current_work)}\n\n"
+        f"What will you work on now?\n{_sanitize_update_value(next_work)}\n\n"
+        f"Any blockers or notes?\n{_sanitize_update_value(blockers)}"
+    )
+
+
+def _split_work_update_content(content: str) -> tuple[str, str, str]:
+    current_work = "—"
+    next_work = "—"
+    blockers = "—"
+    if not content:
+        return current_work, next_work, blockers
+
+    parts = content.split("\n\n")
+    for part in parts:
+        lines = part.split("\n", 1)
+        header = lines[0].strip().lower()
+        body = lines[1].strip() if len(lines) > 1 else "—"
+        if header.startswith("what are you working on?"):
+            current_work = body or "—"
+        elif header.startswith("what will you work on now?"):
+            next_work = body or "—"
+        elif header.startswith("any blockers or notes?"):
+            blockers = body or "—"
+    return current_work, next_work, blockers
 
 
 def _format_interval(hours: float) -> str:
@@ -45,16 +79,37 @@ class WorkUpdateModal(discord.ui.Modal):
         self.prompt_slot = prompt_slot
         self.question_text = question_text
 
-        self.content = discord.ui.TextInput(
-            label="Your Answer",
-            placeholder=(question_text[:100] if question_text else DEFAULT_WORK_UPDATE_QUESTION),
+        self.current_work = discord.ui.TextInput(
+            label="What are you working on?",
+            placeholder="What have you been working on in this period?",
             style=discord.TextStyle.paragraph,
             required=True,
-            max_length=1200,
+            max_length=800,
         )
-        self.add_item(self.content)
+        self.next_work = discord.ui.TextInput(
+            label="What will you work on now?",
+            placeholder="What are you doing next?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=800,
+        )
+        self.blockers = discord.ui.TextInput(
+            label="Any blockers or notes?",
+            placeholder="Any blockers or k thyo dai le vannu vako?",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.current_work)
+        self.add_item(self.next_work)
+        self.add_item(self.blockers)
 
     async def on_submit(self, interaction: discord.Interaction):
+        content = _compose_work_update_content(
+            self.current_work.value,
+            self.next_work.value,
+            self.blockers.value,
+        )
         await self.bot.db.submit_work_update(
             self.guild_id,
             self.user_id,
@@ -62,7 +117,7 @@ class WorkUpdateModal(discord.ui.Modal):
             self.time_entry_id,
             self.prompt_slot,
             self.question_text,
-            str(self.content),
+            content,
         )
         await _post_work_update_archive(
             self.bot,
@@ -70,7 +125,7 @@ class WorkUpdateModal(discord.ui.Modal):
             self.username,
             self.prompt_slot,
             self.question_text,
-            str(self.content),
+            content,
         )
         await interaction.response.send_message(
             "✅ Update recorded.",
@@ -168,10 +223,13 @@ async def _post_work_update_archive(
         color=0x57F287,
         timestamp=datetime.utcnow(),
     )
+    current_work, next_work, blockers = _split_work_update_content(content)
     embed.add_field(name="Employee", value=username, inline=True)
     embed.add_field(name="Prompt", value=f"`#{prompt_slot}`", inline=True)
-    embed.add_field(name="Question", value=(question_text or DEFAULT_WORK_UPDATE_QUESTION)[:1024], inline=False)
-    embed.add_field(name="Answer", value=content[:1024], inline=False)
+    embed.add_field(name="Instruction", value=(question_text or DEFAULT_WORK_UPDATE_QUESTION)[:1024], inline=False)
+    embed.add_field(name="What are you working on?", value=current_work[:1024], inline=False)
+    embed.add_field(name="What will you work on now?", value=next_work[:1024], inline=False)
+    embed.add_field(name="Any blockers or notes?", value=blockers[:1024], inline=False)
     try:
         await channel.send(embed=embed)
     except Exception:
@@ -213,14 +271,23 @@ async def _deliver_work_update_prompt(bot, guild: discord.Guild, row: dict, conf
         title="📝 Work Update Needed",
         description=(
             f"You've been clocked in long enough for update #{prompt_slot}.\n"
-            f"Please answer the question below for the last {_format_interval(interval_hours)}."
+            f"Please submit your structured update for the last {_format_interval(interval_hours)}."
         ),
         color=0x5865F2,
         timestamp=datetime.utcnow(),
     )
     embed.add_field(name="Clocked In", value=f"`{row['clock_in'].replace('T', ' ')[:16]} UTC`", inline=True)
     embed.add_field(name="Prompt", value=f"`#{prompt_slot}`", inline=True)
-    embed.add_field(name="Question", value=question_text, inline=False)
+    embed.add_field(name="Instruction", value=question_text, inline=False)
+    embed.add_field(
+        name="Form",
+        value=(
+            "1. What are you working on?\n"
+            "2. What will you work on now?\n"
+            "3. Any blockers or notes?"
+        ),
+        inline=False,
+    )
     embed.set_footer(text="HR Bot • Work Updates")
 
     try:
@@ -284,7 +351,7 @@ class Updates(commands.Cog):
 @app_commands.describe(
     enabled="Turn periodic work updates on or off",
     interval_hours="How many hours between prompts while clocked in",
-    question="Question staff should answer each time",
+    question="Instruction shown above the 3-part update form",
     archive_channel="Channel or thread where submitted answers should be mirrored",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -299,7 +366,7 @@ async def update_config(
         await interaction.response.send_message("❌ Interval must be greater than 0 hours.", ephemeral=True)
         return
     if len(question.strip()) < 5:
-        await interaction.response.send_message("❌ Question is too short.", ephemeral=True)
+        await interaction.response.send_message("❌ Instruction is too short.", ephemeral=True)
         return
 
     archive_obj = None
@@ -329,7 +396,16 @@ async def update_config(
     embed.add_field(name="Status", value="🟢 Enabled" if enabled else "🔴 Disabled", inline=True)
     embed.add_field(name="Interval", value=f"`{_format_interval(interval_hours)}`", inline=True)
     embed.add_field(name="Archive Channel", value=archive_obj.mention if archive_obj else "Not set", inline=True)
-    embed.add_field(name="Question", value=question.strip(), inline=False)
+    embed.add_field(name="Instruction", value=question.strip(), inline=False)
+    embed.add_field(
+        name="Form Fields",
+        value=(
+            "What are you working on?\n"
+            "What will you work on now?\n"
+            "Any blockers or notes?"
+        ),
+        inline=False,
+    )
     embed.set_footer(text="Clocked-in staff will be asked for updates at this interval.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -355,8 +431,17 @@ async def update_status(interaction: discord.Interaction):
         inline=True,
     )
     embed.add_field(
-        name="Question",
+        name="Instruction",
         value=config.get("question_text") or DEFAULT_WORK_UPDATE_QUESTION,
+        inline=False,
+    )
+    embed.add_field(
+        name="Form Fields",
+        value=(
+            "What are you working on?\n"
+            "What will you work on now?\n"
+            "Any blockers or notes?"
+        ),
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

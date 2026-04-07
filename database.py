@@ -108,6 +108,8 @@ class Database:
                     name        TEXT NOT NULL,
                     cron_time   TEXT NOT NULL,
                     message     TEXT NOT NULL,
+                    meeting_url TEXT,
+                    voice_duration_minutes INTEGER DEFAULT 20,
                     active      INTEGER DEFAULT 1,
                     ping_role   TEXT,
                     last_sent   TEXT
@@ -190,6 +192,14 @@ class Database:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN on_break_role_id TEXT")
             if "activity_log_channel_id" not in columns:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN activity_log_channel_id TEXT")
+            standup_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(standup_schedules)")).fetchall()
+            }
+            if "meeting_url" not in standup_columns:
+                await db.execute("ALTER TABLE standup_schedules ADD COLUMN meeting_url TEXT")
+            if "voice_duration_minutes" not in standup_columns:
+                await db.execute("ALTER TABLE standup_schedules ADD COLUMN voice_duration_minutes INTEGER DEFAULT 20")
             update_config_columns = {
                 row[1]
                 for row in await (await db.execute("PRAGMA table_info(work_update_config)")).fetchall()
@@ -455,12 +465,22 @@ class Database:
 
     # ─── STANDUP ─────────────────────────────────────────────────────────────
 
-    async def add_standup(self, guild_id, channel_id, name, cron_time, message, ping_role=None) -> int:
+    async def add_standup(
+        self,
+        guild_id,
+        channel_id,
+        name,
+        cron_time,
+        message,
+        ping_role=None,
+        meeting_url=None,
+        voice_duration_minutes: int = 20,
+    ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "INSERT INTO standup_schedules (guild_id, channel_id, name, cron_time, message, ping_role) "
-                "VALUES (?,?,?,?,?,?)",
-                (guild_id, channel_id, name, cron_time, message, ping_role)
+                "INSERT INTO standup_schedules (guild_id, channel_id, name, cron_time, message, ping_role, meeting_url, voice_duration_minutes) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (guild_id, channel_id, name, cron_time, message, ping_role, meeting_url, voice_duration_minutes)
             )
             await db.commit()
             return cursor.lastrowid

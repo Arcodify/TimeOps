@@ -21,6 +21,27 @@ def fmt_duration(minutes: int) -> str:
     return f"{h}h {m:02d}m"
 
 
+def _split_work_update_content(content: str) -> tuple[str, str, str]:
+    current_work = ""
+    next_work = ""
+    blockers = ""
+    if not content:
+        return current_work, next_work, blockers
+
+    parts = content.split("\n\n")
+    for part in parts:
+        lines = part.split("\n", 1)
+        header = lines[0].strip().lower()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        if header.startswith("what are you working on?"):
+            current_work = body
+        elif header.startswith("what will you work on now?"):
+            next_work = body
+        elif header.startswith("any blockers or notes?"):
+            blockers = body
+    return current_work, next_work, blockers
+
+
 class CSVExporter:
     def __init__(self, db):
         self.db = db
@@ -122,7 +143,7 @@ class CSVExporter:
             "Reason": r["reason"] or "",
             "Status": r["status"].upper(),
             "Approver": r["approver_name"] or "",
-            "Submitted At": r["created_at"][:10]
+            "Submitted At": (r["created_at"] or "").replace("T", " ")[:19]
         } for r in requests]
         
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -147,6 +168,7 @@ class CSVExporter:
 
         rows = []
         for item in updates:
+            current_work, next_work, blockers = _split_work_update_content(item.get("content") or "")
             rows.append({
                 "Date": item["prompted_at"][:10],
                 "Employee": item["username"],
@@ -154,7 +176,10 @@ class CSVExporter:
                 "Prompt Slot": item["prompt_slot"],
                 "Prompted At": item["prompted_at"].replace("T", " ")[:19],
                 "Submitted At": (item.get("submitted_at") or "").replace("T", " ")[:19],
-                "Question": item.get("question_text") or "",
+                "Instruction": item.get("question_text") or "",
+                "Current Work": current_work,
+                "Next Work": next_work,
+                "Blockers / Notes": blockers,
                 "Answer": item.get("content") or "",
                 "Time Entry ID": item["time_entry_id"],
             })
@@ -168,7 +193,10 @@ class CSVExporter:
             "Prompt Slot",
             "Prompted At",
             "Submitted At",
-            "Question",
+            "Instruction",
+            "Current Work",
+            "Next Work",
+            "Blockers / Notes",
             "Answer",
             "Time Entry ID",
         ])

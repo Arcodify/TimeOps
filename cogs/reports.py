@@ -24,6 +24,10 @@ def fmt_duration(minutes: int) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
+def _format_period_range(start: datetime, end: datetime) -> str:
+    return f"{start.strftime('%Y-%m-%d %H:%M UTC')} → {end.strftime('%Y-%m-%d %H:%M UTC')}"
+
+
 class Reports(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -63,7 +67,7 @@ async def report_timesheet(
 
     embed = discord.Embed(
         title="📊 Timesheet Report",
-        description=f"Period: **{period}** ({start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')})",
+        description=f"Period: **{period}** ({_format_period_range(start, end)})",
         color=0x5865F2,
         timestamp=datetime.utcnow()
     )
@@ -96,7 +100,7 @@ async def report_summary(interaction: discord.Interaction, period: str = "week")
 
     embed = discord.Embed(
         title="📈 Summary Report",
-        description=f"Period: **{period}** ({start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')})",
+        description=f"Period: **{period}** ({_format_period_range(start, end)})",
         color=0x57F287,
         timestamp=datetime.utcnow()
     )
@@ -233,7 +237,7 @@ async def report_updates(
     distinct_users = len({row["user_id"] for row in rows})
     embed = discord.Embed(
         title="📝 Work Updates Report",
-        description=f"Period: **{period}** ({start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')})",
+        description=f"Period: **{period}** ({_format_period_range(start, end)})",
         color=0x5865F2,
         timestamp=datetime.utcnow(),
     )
@@ -264,7 +268,7 @@ async def report_mine(interaction: discord.Interaction, period: str = "week"):
         timestamp=datetime.utcnow()
     )
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
-    embed.add_field(name="Period", value=f"{start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}", inline=False)
+    embed.add_field(name="Period", value=_format_period_range(start, end), inline=False)
     embed.add_field(name="Total Hours", value=f"**{fmt_duration(summary['total_minutes'])}**", inline=True)
     embed.add_field(name="Break Time", value=fmt_duration(summary["break_minutes"]), inline=True)
     embed.add_field(name="Days Worked", value=str(summary["days_worked"]), inline=True)
