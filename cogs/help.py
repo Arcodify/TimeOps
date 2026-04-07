@@ -28,6 +28,8 @@ PAGES = [
             ("/break start [type]", "Start a manual break — can assign the configured On Break role"),
             ("/break end", "End your current break"),
             ("/break status", "View break history for your active session"),
+            ("/break configure [break1...] [break2...]", "Set up to two automatic company break windows *(Admin)*"),
+            ("/break schedule", "View the configured automatic break windows"),
         ]
     },
     {
@@ -37,6 +39,7 @@ PAGES = [
             ("/leave request", "Submit a leave request (opens a form)"),
             ("/leave list", "View your own leave requests + statuses"),
             ("/leave pending", "View all pending requests *(Admin)*"),
+            ("/leavepanel", "Post a leave request panel in this channel *(Admin)*"),
         ]
     },
     {
@@ -94,7 +97,7 @@ PAGES = [
         "title": "⚙️ Admin Configuration",
         "color": 0x99AAB5,
         "fields": [
-            ("/hrconfig configure", "Set leave channel, admin role, present role, on-break role, and timezone"),
+            ("/hrconfig configure", "Set activity log channel, admin role, present role, on-break role, and timezone"),
             ("/hrconfig view", "View current bot configuration"),
             ("/overtime config", "Set daily/weekly hours, break allowance, and blocked clock-in days"),
         ]

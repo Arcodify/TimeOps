@@ -1,7 +1,7 @@
 """
 Admin Cog
-/hrsetup — configure leave channel, admin role, timezone
-/hrconfig configure — configure leave channel, admin role, present role, on-break role, timezone
+/hrsetup — configure activity log channel, admin role, timezone
+/hrconfig configure — configure activity log channel, admin role, present role, on-break role, timezone
 /overtime config — set daily/weekly hours and auto-out limit
 """
 
@@ -73,19 +73,19 @@ def _resolve_role_input(guild: discord.Guild, value):
     return guild.get_role(role_id)
 
 
-async def _resolve_leave_channel(interaction: discord.Interaction, leave_channel):
-    if leave_channel is None:
+async def _resolve_text_channel(interaction: discord.Interaction, channel_input):
+    if channel_input is None:
         return None
 
-    if isinstance(leave_channel, (discord.TextChannel, discord.Thread)):
-        return leave_channel
+    if isinstance(channel_input, (discord.TextChannel, discord.Thread)):
+        return channel_input
 
     channel = None
-    if hasattr(leave_channel, "resolve"):
-        channel = leave_channel.resolve()
-    if channel is None and hasattr(leave_channel, "fetch"):
+    if hasattr(channel_input, "resolve"):
+        channel = channel_input.resolve()
+    if channel is None and hasattr(channel_input, "fetch"):
         try:
-            channel = await leave_channel.fetch()
+            channel = await channel_input.fetch()
         except Exception:
             channel = None
 
@@ -98,7 +98,7 @@ async def _resolve_leave_channel(interaction: discord.Interaction, leave_channel
 
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message(
-            "❌ Leave notifications need a text channel or thread. Forum, voice, stage, and category channels are not supported.",
+            "❌ Activity logging needs a text channel or thread. Forum, voice, stage, and category channels are not supported.",
             ephemeral=True,
         )
         return None
@@ -116,15 +116,15 @@ class Admin(commands.Cog):
     async def hrsetup_prefix(
         self,
         ctx: commands.Context,
-        leave_channel: str = None,
+        activity_log_channel: str = None,
         admin_role: str = None,
         timezone: str = "UTC"
     ):
-        leave_obj = await _resolve_channel_input(ctx.guild, leave_channel) if leave_channel else None
+        activity_obj = await _resolve_channel_input(ctx.guild, activity_log_channel) if activity_log_channel else None
         role_obj = _resolve_role_input(ctx.guild, admin_role) if admin_role else None
 
-        if leave_channel and leave_obj is None:
-            await ctx.send("❌ I could not resolve that leave channel. Use a channel mention like `#leave-requests` or a channel ID.")
+        if activity_log_channel and activity_obj is None:
+            await ctx.send("❌ I could not resolve that activity log channel. Use a channel mention like `#hr-activity` or a channel ID.")
             return
 
         if admin_role and role_obj is None:
@@ -133,13 +133,13 @@ class Admin(commands.Cog):
 
         await self.db.set_guild_config(
             str(ctx.guild.id),
-            leave_channel_id=str(leave_obj.id) if leave_obj else None,
+            activity_log_channel_id=str(activity_obj.id) if activity_obj else None,
             admin_role_id=str(role_obj.id) if role_obj else None,
             timezone=timezone
         )
 
         embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
-        embed.add_field(name="Leave Channel", value=leave_obj.mention if leave_obj else "Not set", inline=True)
+        embed.add_field(name="Activity Log Channel", value=activity_obj.mention if activity_obj else "Not set", inline=True)
         embed.add_field(name="Admin Role", value=role_obj.mention if role_obj else "Not set", inline=True)
         embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
         await ctx.send(embed=embed)
@@ -147,7 +147,7 @@ class Admin(commands.Cog):
 
 @admin_group.command(name="configure", description="Configure HR bot for this server")
 @app_commands.describe(
-    leave_channel="Text channel or thread for leave request notifications",
+    activity_log_channel="Text channel or thread for attendance and leave activity logs",
     admin_role="Role that can approve leave and view admin reports",
     present_role="Role assigned while someone is clocked in",
     on_break_role="Role assigned while someone is on a manual break",
@@ -156,20 +156,20 @@ class Admin(commands.Cog):
 @app_commands.checks.has_permissions(administrator=True)
 async def hrconfigure(
     interaction: discord.Interaction,
-    leave_channel: discord.app_commands.AppCommandChannel = None,
+    activity_log_channel: discord.app_commands.AppCommandChannel = None,
     admin_role: discord.Role = None,
     present_role: discord.Role = None,
     on_break_role: discord.Role = None,
     timezone: str = "UTC"
 ):
     db = interaction.client.db
-    leave_channel = await _resolve_leave_channel(interaction, leave_channel)
-    if leave_channel is None and interaction.response.is_done():
+    activity_log_channel = await _resolve_text_channel(interaction, activity_log_channel)
+    if activity_log_channel is None and interaction.response.is_done():
         return
 
     await db.set_guild_config(
         str(interaction.guild_id),
-        leave_channel_id=str(leave_channel.id) if leave_channel else None,
+        activity_log_channel_id=str(activity_log_channel.id) if activity_log_channel else None,
         admin_role_id=str(admin_role.id) if admin_role else None,
         present_role_id=str(present_role.id) if present_role else None,
         on_break_role_id=str(on_break_role.id) if on_break_role else None,
@@ -177,7 +177,7 @@ async def hrconfigure(
     )
 
     embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
-    embed.add_field(name="Leave Channel", value=leave_channel.mention if leave_channel else "Not set", inline=True)
+    embed.add_field(name="Activity Log Channel", value=activity_log_channel.mention if activity_log_channel else "Not set", inline=True)
     embed.add_field(name="Admin Role", value=admin_role.mention if admin_role else "Not set", inline=True)
     embed.add_field(name="Present Role", value=present_role.mention if present_role else "Not set", inline=True)
     embed.add_field(name="On Break Role", value=on_break_role.mention if on_break_role else "Not set", inline=True)
@@ -196,10 +196,10 @@ async def hrview(interaction: discord.Interaction):
 
     embed = discord.Embed(title="⚙️ HR Bot Configuration", color=0x5865F2)
 
-    leave_ch = config.get("leave_channel_id")
+    activity_ch = config.get("activity_log_channel_id") or config.get("leave_channel_id")
     embed.add_field(
-        name="Leave Channel",
-        value=f"<#{leave_ch}>" if leave_ch else "Not configured",
+        name="Activity Log Channel",
+        value=f"<#{activity_ch}>" if activity_ch else "Not configured",
         inline=True
     )
 

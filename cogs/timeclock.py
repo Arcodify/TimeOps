@@ -11,10 +11,12 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from database import Database, parse_blocked_weekdays
+from cogs.activity_log import post_activity_log
 from cogs.breaks import (
     _apply_on_break_role,
     _clear_on_break_role,
     _end_break,
+    _get_current_scheduled_break,
     _get_active_break,
     _get_session_breaks,
     _start_break,
@@ -81,6 +83,25 @@ async def _can_clock_in(db: Database, guild_id: str) -> tuple[bool, str | None]:
     return True, None
 
 
+async def _get_auto_break_message(bot, guild: discord.Guild, active_break: dict | None) -> str | None:
+    if guild is None or not active_break or active_break.get("break_type") != "scheduled":
+        return None
+
+    schedule = await _get_current_scheduled_break(bot, guild)
+    if schedule is None:
+        return None
+
+    if (active_break.get("reason") or "") != schedule["name"]:
+        return None
+
+    config = await bot.db.get_guild_config(str(guild.id))
+    timezone_name = config.get("timezone") or "UTC"
+    return (
+        "⚠️ This is an automatic company break window.\n"
+        f"It will end at `{schedule['end_time']}` ({timezone_name})."
+    )
+
+
 class ClockPanel(discord.ui.View):
     """Persistent clock in/out panel with buttons."""
     def __init__(self, db: Database):
@@ -107,7 +128,7 @@ class ClockPanel(discord.ui.View):
                 ephemeral=True
             )
             return
-        
+
         embed = discord.Embed(
             title="✅ Clocked In",
             description=f"{interaction.user.mention} is now on the clock!",
@@ -122,8 +143,41 @@ class ClockPanel(discord.ui.View):
             pass
         except discord.HTTPException:
             pass
+
+        schedule = await _get_current_scheduled_break(interaction.client, interaction.guild)
+        if schedule is not None:
+            await _start_break(
+                self.db.path,
+                str(interaction.guild_id),
+                str(interaction.user.id),
+                interaction.user.display_name,
+                "scheduled",
+                result["entry_id"],
+                reason=schedule["name"],
+            )
+            try:
+                if isinstance(interaction.user, discord.Member):
+                    await _apply_on_break_role(interaction.client, interaction.guild, interaction.user)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
+            embed.add_field(name="Break", value=f"Auto break active: **{schedule['name']}**", inline=False)
+
         embed.add_field(name="Started", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`")
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="🟢 Clocked In",
+            color=0x57F287,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Started", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                ("Status", f"Session opened{' • auto break active' if schedule is not None else ''}", False),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="🔴 Clock Out", style=discord.ButtonStyle.danger, custom_id="hr:clockout")
@@ -147,7 +201,7 @@ class ClockPanel(discord.ui.View):
             pass
         except discord.HTTPException:
             pass
-        
+
         embed = discord.Embed(
             title="🔴 Clocked Out",
             description=f"{interaction.user.mention} has clocked out.",
@@ -158,6 +212,19 @@ class ClockPanel(discord.ui.View):
         embed.add_field(name="Clock In", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`", inline=True)
         embed.add_field(name="Clock Out", value=f"`{result['clock_out'].replace('T',' ')[:16]} UTC`", inline=True)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="🔴 Clocked Out",
+            color=0xED4245,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Clock In", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
+                ("Duration", f"`{fmt_duration(result['duration_minutes'])}`", True),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="☕ Start Break", style=discord.ButtonStyle.primary, custom_id="hr:break_start", row=1)
@@ -181,36 +248,64 @@ class ClockPanel(discord.ui.View):
             )
             return
 
-        _, now = await _start_break(
-            self.db.path,
-            guild_id,
-            user_id,
-            interaction.user.display_name,
-            "break",
-            active_entry["id"],
-        )
+        schedule = await _get_current_scheduled_break(interaction.client, interaction.guild)
+        if schedule is not None:
+            _, now = await _start_break(
+                self.db.path,
+                guild_id,
+                user_id,
+                interaction.user.display_name,
+                "scheduled",
+                active_entry["id"],
+                reason=schedule["name"],
+            )
 
-        try:
-            if isinstance(interaction.user, discord.Member):
-                await _apply_on_break_role(interaction.client, interaction.guild, interaction.user)
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
+            try:
+                if isinstance(interaction.user, discord.Member):
+                    await _apply_on_break_role(interaction.client, interaction.guild, interaction.user)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
 
-        embed = discord.Embed(
-            title="☕ Break Started",
-            description="Your break is running. Use **End Break** when you return.",
-            color=0xFEE75C,
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name="Started", value=f"`{now.replace('T',' ')[:16]} UTC`", inline=True)
-        embed.add_field(name="Session", value="Still clocked in", inline=True)
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = discord.Embed(
+                title="☕ Scheduled Break Started",
+                description=f"You're now on the automatic break window: **{schedule['name']}**.",
+                color=0xFEE75C,
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Started", value=f"`{now.replace('T',' ')[:16]} UTC`", inline=True)
+            embed.add_field(name="Session", value="Still clocked in", inline=True)
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await post_activity_log(
+                interaction.client,
+                guild_id,
+                title="☕ Automatic Break Started",
+                color=0xFEE75C,
+                fields=[
+                    ("Employee", interaction.user.mention, True),
+                    ("Break", schedule["name"], True),
+                    ("Started", f"`{now.replace('T', ' ')[:16]} UTC`", True),
+                ],
+                thumbnail_url=interaction.user.display_avatar.url,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        await interaction.response.send_modal(OffScheduleBreakModal(self.db, active_entry))
 
     @discord.ui.button(label="✅ End Break", style=discord.ButtonStyle.secondary, custom_id="hr:break_end", row=1)
     async def break_end_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        active_break = await _get_active_break(
+            self.db.path,
+            str(interaction.guild_id),
+            str(interaction.user.id),
+        )
+        auto_break_message = await _get_auto_break_message(interaction.client, interaction.guild, active_break)
+        if auto_break_message:
+            await interaction.response.send_message(auto_break_message, ephemeral=True)
+            return
+
         result = await _end_break(
             self.db.path,
             str(interaction.guild_id),
@@ -240,11 +335,98 @@ class ClockPanel(discord.ui.View):
         embed.add_field(name="Duration", value=f"**{fmt_duration(result['duration_minutes'])}**", inline=True)
         embed.add_field(name="Ended", value=f"`{result['break_end'].replace('T',' ')[:16]} UTC`", inline=True)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="✅ Break Ended",
+            color=0x57F287,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Break", result.get("reason") or result.get("break_type", "Break").title(), True),
+                ("Duration", f"`{fmt_duration(result['duration_minutes'])}`", True),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="📊 My Status", style=discord.ButtonStyle.secondary, custom_id="hr:status")
     async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _send_status(interaction, self.db, interaction.user)
+
+
+class OffScheduleBreakModal(discord.ui.Modal):
+    def __init__(self, db: Database, active_entry: dict):
+        super().__init__(title="Off-Schedule Break")
+        self.db = db
+        self.active_entry = active_entry
+        self.reason = discord.ui.TextInput(
+            label="Reason",
+            placeholder="Why do you need a break outside the scheduled company break times?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.reason.value.strip()
+        if not reason:
+            await interaction.response.send_message("⚠️ A reason is required for an off-schedule break.", ephemeral=True)
+            return
+
+        active_entry = await self.db.get_active_entry(str(interaction.guild_id), str(interaction.user.id))
+        if not active_entry or active_entry["id"] != self.active_entry["id"]:
+            await interaction.response.send_message(
+                "⚠️ Your active session changed. Please try the break button again.",
+                ephemeral=True,
+            )
+            return
+
+        active_break = await _get_active_break(self.db.path, str(interaction.guild_id), str(interaction.user.id))
+        if active_break:
+            await interaction.response.send_message("⚠️ You're already on a break.", ephemeral=True)
+            return
+
+        _, now = await _start_break(
+            self.db.path,
+            str(interaction.guild_id),
+            str(interaction.user.id),
+            interaction.user.display_name,
+            "break",
+            self.active_entry["id"],
+            reason=reason,
+        )
+
+        try:
+            if isinstance(interaction.user, discord.Member):
+                await _apply_on_break_role(interaction.client, interaction.guild, interaction.user)
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+        embed = discord.Embed(
+            title="☕ Break Started",
+            description="Your off-schedule break has been recorded.",
+            color=0xFEE75C,
+            timestamp=datetime.utcnow(),
+        )
+        embed.add_field(name="Started", value=f"`{now.replace('T',' ')[:16]} UTC`", inline=True)
+        embed.add_field(name="Reason", value=reason[:1024], inline=False)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="☕ Off-Schedule Break Started",
+            color=0xFEE75C,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Started", f"`{now.replace('T', ' ')[:16]} UTC`", True),
+                ("Reason", reason[:1024], False),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def _send_status(interaction: discord.Interaction, db: Database, user: discord.User = None):
@@ -346,11 +528,44 @@ class TimeClock(commands.Cog):
             pass
         except discord.HTTPException:
             pass
+        schedule = await _get_current_scheduled_break(interaction.client, interaction.guild)
+        if schedule is not None:
+            await _start_break(
+                self.db.path,
+                str(interaction.guild_id),
+                str(interaction.user.id),
+                interaction.user.display_name,
+                "scheduled",
+                result["entry_id"],
+                reason=schedule["name"],
+            )
+            try:
+                if isinstance(interaction.user, discord.Member):
+                    await _apply_on_break_role(interaction.client, interaction.guild, interaction.user)
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
         embed.add_field(name="Employee", value=interaction.user.mention)
         embed.add_field(name="Started", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`")
+        if schedule is not None:
+            embed.add_field(name="Break", value=f"Auto break active: **{schedule['name']}**", inline=False)
         if note:
             embed.add_field(name="Note", value=note, inline=False)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="🟢 Clocked In",
+            color=0x57F287,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Started", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                ("Note", note or "—", False),
+                ("Status", f"Session opened{' • auto break active' if schedule is not None else ''}", False),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="clockout", description="Clock out to end your work session")
@@ -387,6 +602,20 @@ class TimeClock(commands.Cog):
         if overtime > 0:
             embed.add_field(name="⚡ Overtime This Session", value=fmt_duration(int(overtime)), inline=True)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await post_activity_log(
+            interaction.client,
+            str(interaction.guild_id),
+            title="🔴 Clocked Out",
+            color=0xED4245,
+            fields=[
+                ("Employee", interaction.user.mention, True),
+                ("Clock In", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
+                ("Net Duration", f"`{fmt_duration(net_minutes)}`", True),
+                ("Break Time", f"`{fmt_duration(break_minutes)}`", True),
+            ],
+            thumbnail_url=interaction.user.display_avatar.url,
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="status", description="Check your current clock status and today's hours")
@@ -398,7 +627,7 @@ class TimeClock(commands.Cog):
     async def clock_panel(self, interaction: discord.Interaction):
         embed = discord.Embed(title="⏱️ HR Time Clock", color=0x5865F2)
         embed.description = (
-            "Quick actions for your shift.\n"
+            "Quick actions for your shift and breaks.\n"
             "━━━━━━━━━━━━━━━━━━"
         )
         embed.add_field(
@@ -415,9 +644,10 @@ class TimeClock(commands.Cog):
             name="Breaks",
             value=(
                 "☕ **Start Break**\n"
-                "Pause without clocking out.\n\n"
+                "During company break windows it starts automatically.\n"
+                "Outside those windows, you'll be asked for a reason.\n\n"
                 "✅ **End Break**\n"
-                "Resume your shift."
+                "Resume your shift after a manual break."
             ),
             inline=True
         )
@@ -432,7 +662,7 @@ class TimeClock(commands.Cog):
         )
         embed.add_field(
             name="Tip",
-            value="Clocking in can add your Present role. Manual break buttons separately manage the On Break role.",
+            value="Clocking in can add your Present role. Automatic and manual breaks both manage the On Break role.",
             inline=False
         )
         embed.set_footer(text="HR Bot • Time Tracker")

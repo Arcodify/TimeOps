@@ -123,6 +123,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id    TEXT PRIMARY KEY,
                     leave_channel_id TEXT,
+                    activity_log_channel_id TEXT,
                     admin_role_id TEXT,
                     present_role_id TEXT,
                     on_break_role_id TEXT,
@@ -144,7 +145,17 @@ class Database:
                     break_start TEXT NOT NULL,
                     break_end   TEXT,
                     duration_minutes INTEGER,
-                    break_type  TEXT DEFAULT 'break'
+                    break_type  TEXT DEFAULT 'break',
+                    reason      TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS scheduled_breaks (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id    TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    start_time  TEXT NOT NULL,
+                    end_time    TEXT NOT NULL,
+                    active      INTEGER DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS work_update_config (
@@ -177,6 +188,8 @@ class Database:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN present_role_id TEXT")
             if "on_break_role_id" not in columns:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN on_break_role_id TEXT")
+            if "activity_log_channel_id" not in columns:
+                await db.execute("ALTER TABLE guild_config ADD COLUMN activity_log_channel_id TEXT")
             update_config_columns = {
                 row[1]
                 for row in await (await db.execute("PRAGMA table_info(work_update_config)")).fetchall()
@@ -193,6 +206,12 @@ class Database:
             }
             if "question_text" not in work_updates_columns:
                 await db.execute("ALTER TABLE work_updates ADD COLUMN question_text TEXT")
+            break_entries_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(break_entries)")).fetchall()
+            }
+            if "reason" not in break_entries_columns:
+                await db.execute("ALTER TABLE break_entries ADD COLUMN reason TEXT")
             await db.commit()
         log.info("Database initialized")
 
@@ -286,6 +305,24 @@ class Database:
                         f"You were automatically clocked out after **{limit_hours:.0f} hours**.\n"
                         f"Duration: **{result['duration_minutes']//60}h {result['duration_minutes']%60}m**\n"
                         f"Use `/clockin` to clock back in."
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    from cogs.activity_log import post_activity_log
+
+                    await post_activity_log(
+                        bot,
+                        row["guild_id"],
+                        title="⏰ Auto Clocked Out",
+                        color=0xED4245,
+                        fields=[
+                            ("Employee", row["username"], True),
+                            ("Clock In", f"`{row['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                            ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
+                            ("Duration", f"`{result['duration_minutes']//60}h {result['duration_minutes']%60:02d}m`", True),
+                        ],
                     )
                 except Exception:
                     pass
@@ -407,6 +444,15 @@ class Database:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_pending_leave_requests_with_messages(self) -> List[Dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM leave_requests WHERE status='pending' AND message_id IS NOT NULL"
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     # ─── STANDUP ─────────────────────────────────────────────────────────────
 
     async def add_standup(self, guild_id, channel_id, name, cron_time, message, ping_role=None) -> int:
@@ -518,6 +564,37 @@ class Database:
             )
             await db.commit()
 
+    async def get_scheduled_breaks(self, guild_id: str, active_only: bool = True) -> List[Dict]:
+        query = "SELECT * FROM scheduled_breaks WHERE guild_id=?"
+        params = [guild_id]
+        if active_only:
+            query += " AND active=1"
+        query += " ORDER BY start_time ASC, id ASC"
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def replace_scheduled_breaks(self, guild_id: str, schedules: List[Dict]):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM scheduled_breaks WHERE guild_id=?", (guild_id,))
+            for schedule in schedules:
+                await db.execute(
+                    """
+                    INSERT INTO scheduled_breaks (guild_id, name, start_time, end_time, active)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        guild_id,
+                        schedule["name"],
+                        schedule["start_time"],
+                        schedule["end_time"],
+                        1 if schedule.get("active", True) else 0,
+                    ),
+                )
+            await db.commit()
+
     # ─── GUILD CONFIG ────────────────────────────────────────────────────────
 
     async def get_guild_config(self, guild_id: str) -> Dict:
@@ -530,6 +607,7 @@ class Database:
         return {
             "guild_id": guild_id,
             "leave_channel_id": None,
+            "activity_log_channel_id": None,
             "admin_role_id": None,
             "present_role_id": None,
             "on_break_role_id": None,
@@ -541,11 +619,12 @@ class Database:
         existing.update(kwargs)
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO guild_config (guild_id, leave_channel_id, admin_role_id, present_role_id, on_break_role_id, timezone) "
-                "VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO guild_config (guild_id, leave_channel_id, activity_log_channel_id, admin_role_id, present_role_id, on_break_role_id, timezone) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (
                     guild_id,
                     existing.get("leave_channel_id"),
+                    existing.get("activity_log_channel_id"),
                     existing.get("admin_role_id"),
                     existing.get("present_role_id"),
                     existing.get("on_break_role_id"),
