@@ -1,7 +1,8 @@
 """
 Admin Cog
-/hrsetup — configure activity log channel, admin role, timezone
-/hrconfig configure — configure activity log channel, admin role, present role, on-break role, timezone
+/hrsetup — configure activity log channel and admin role
+/hrconfig configure — configure activity log channel, admin role, present role, on-break role
+/timezone set — configure guild timezone once for all bot features
 /overtime config — set daily/weekly hours and auto-out limit
 """
 
@@ -10,6 +11,7 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 import re
+from zoneinfo import ZoneInfo
 from database import normalize_blocked_weekdays
 
 log = logging.getLogger("Admin")
@@ -17,6 +19,7 @@ WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 
 admin_group = app_commands.Group(name="hrconfig", description="HR Bot server configuration")
 overtime_group = app_commands.Group(name="overtime", description="Overtime configuration")
+timezone_group = app_commands.Group(name="timezone", description="Guild timezone configuration")
 
 
 def _weekday_labels(blocked_weekdays: str) -> str:
@@ -118,7 +121,6 @@ class Admin(commands.Cog):
         ctx: commands.Context,
         activity_log_channel: str = None,
         admin_role: str = None,
-        timezone: str = "UTC"
     ):
         activity_obj = await _resolve_channel_input(ctx.guild, activity_log_channel) if activity_log_channel else None
         role_obj = _resolve_role_input(ctx.guild, admin_role) if admin_role else None
@@ -135,13 +137,11 @@ class Admin(commands.Cog):
             str(ctx.guild.id),
             activity_log_channel_id=str(activity_obj.id) if activity_obj else None,
             admin_role_id=str(role_obj.id) if role_obj else None,
-            timezone=timezone
         )
 
         embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
         embed.add_field(name="Activity Log Channel", value=activity_obj.mention if activity_obj else "Not set", inline=True)
         embed.add_field(name="Admin Role", value=role_obj.mention if role_obj else "Not set", inline=True)
-        embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
         await ctx.send(embed=embed)
 
 
@@ -150,8 +150,7 @@ class Admin(commands.Cog):
     activity_log_channel="Text channel or thread for attendance and leave activity logs",
     admin_role="Role that can approve leave and view admin reports",
     present_role="Role assigned while someone is clocked in",
-    on_break_role="Role assigned while someone is on a manual break",
-    timezone="Server timezone for display (e.g. UTC, US/Eastern, Asia/Kathmandu)"
+    on_break_role="Role assigned while someone is on a manual break"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def hrconfigure(
@@ -160,7 +159,6 @@ async def hrconfigure(
     admin_role: discord.Role = None,
     present_role: discord.Role = None,
     on_break_role: discord.Role = None,
-    timezone: str = "UTC"
 ):
     db = interaction.client.db
     activity_log_channel = await _resolve_text_channel(interaction, activity_log_channel)
@@ -173,7 +171,6 @@ async def hrconfigure(
         admin_role_id=str(admin_role.id) if admin_role else None,
         present_role_id=str(present_role.id) if present_role else None,
         on_break_role_id=str(on_break_role.id) if on_break_role else None,
-        timezone=timezone
     )
 
     embed = discord.Embed(title="⚙️ HR Bot Configured", color=0x57F287)
@@ -181,8 +178,7 @@ async def hrconfigure(
     embed.add_field(name="Admin Role", value=admin_role.mention if admin_role else "Not set", inline=True)
     embed.add_field(name="Present Role", value=present_role.mention if present_role else "Not set", inline=True)
     embed.add_field(name="On Break Role", value=on_break_role.mention if on_break_role else "Not set", inline=True)
-    embed.add_field(name="Timezone", value=f"`{timezone}`", inline=True)
-    embed.set_footer(text="Use /hrconfig overtime to set work hour policies")
+    embed.set_footer(text="Use /timezone set and /overtime config for time behavior")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -231,6 +227,88 @@ async def hrview(interaction: discord.Interaction):
     embed.add_field(name="Default Break", value=f"`{work_rules['default_break_minutes']} min`", inline=True)
     embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(work_rules.get("blocked_weekdays")), inline=True)
 
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@admin_group.command(name="reset", description="Delete all HR bot data and setup for this server")
+@app_commands.describe(confirm="Type DELETE to confirm wiping this server's HR bot data")
+@app_commands.checks.has_permissions(administrator=True)
+async def hrreset(interaction: discord.Interaction, confirm: str):
+    if confirm.strip() != "DELETE":
+        await interaction.response.send_message(
+            "❌ Reset cancelled. Type exactly `DELETE` in the confirm field to wipe this server's HR bot data.",
+            ephemeral=True,
+        )
+        return
+
+    scheduler = getattr(interaction.client, "standup_scheduler", None)
+    if scheduler is not None:
+        stale_ids = []
+        for channel_id, meta in list(scheduler.active_voice_rooms.items()):
+            if str(meta.get("guild_id")) != str(interaction.guild_id):
+                continue
+            channel = interaction.guild.get_channel(channel_id)
+            if channel is not None:
+                try:
+                    await channel.delete(reason="HR bot server reset")
+                except Exception:
+                    pass
+            stale_ids.append(channel_id)
+        for channel_id in stale_ids:
+            scheduler.active_voice_rooms.pop(channel_id, None)
+
+    await interaction.client.db.reset_guild_data(str(interaction.guild_id))
+
+    embed = discord.Embed(title="🧨 HR Bot Server Reset", color=0xED4245)
+    embed.description = "All stored HR bot setup and data for this server have been deleted."
+    embed.add_field(
+        name="Removed",
+        value=(
+            "Config, time entries, leave requests, standups, break logs, scheduled breaks, "
+            "work updates, reminders, and holidays."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Manual Cleanup Still Needed",
+        value="Previously posted panel messages in channels are not tracked, so delete old panels manually if you want them gone.",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@timezone_group.command(name="set", description="Set the timezone used across this server")
+@app_commands.describe(value="Timezone name like UTC, US/Eastern, Europe/London, Asia/Kathmandu")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def timezone_set(interaction: discord.Interaction, value: str):
+    timezone_name = value.strip()
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Invalid timezone. Use an IANA timezone like `UTC`, `US/Eastern`, `Europe/London`, or `Asia/Kathmandu`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.client.db.set_guild_config(str(interaction.guild_id), timezone=timezone_name)
+
+    embed = discord.Embed(title="🕒 Timezone Updated", color=0x57F287)
+    embed.add_field(name="Timezone", value=f"`{timezone_name}`", inline=True)
+    embed.add_field(
+        name="Used By",
+        value="Standups, breaks, blocked clock-in days, and other server time features.",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@timezone_group.command(name="view", description="View the timezone used across this server")
+async def timezone_view(interaction: discord.Interaction):
+    config = await interaction.client.db.get_guild_config(str(interaction.guild_id))
+    timezone_name = config.get("timezone") or "UTC"
+    embed = discord.Embed(title="🕒 Server Timezone", color=0x5865F2)
+    embed.add_field(name="Timezone", value=f"`{timezone_name}`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -287,4 +365,5 @@ async def setup(bot):
     cog = Admin(bot)
     bot.tree.add_command(admin_group)
     bot.tree.add_command(overtime_group)
+    bot.tree.add_command(timezone_group)
     await bot.add_cog(cog)

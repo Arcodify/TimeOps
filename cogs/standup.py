@@ -9,10 +9,20 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("Standup")
 
 standup_group = app_commands.Group(name="standup", description="Recurring standup meeting management")
+
+
+async def _get_guild_timezone(bot, guild_id: str) -> tuple[ZoneInfo, str]:
+    config = await bot.db.get_guild_config(guild_id)
+    timezone_name = config.get("timezone") or "UTC"
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except Exception:
+        return ZoneInfo("UTC"), "UTC"
 
 
 class Standup(commands.Cog):
@@ -24,7 +34,7 @@ class Standup(commands.Cog):
 @app_commands.describe(
     name="Standup name (e.g. 'Morning Standup')",
     channel="Channel to post in",
-    times="Time(s) in HH:MM UTC format, comma-separated for multiple (e.g. '09:00' or '09:00,14:00')",
+    times="Time(s) in HH:MM server timezone format, comma-separated for multiple (e.g. '09:00' or '09:00,14:00')",
     message="Optional short text shown above the meeting links",
     ping_role="Optional role to ping",
     meeting_url="Optional external meeting URL (Google Meet, Zoom, etc.)",
@@ -42,6 +52,7 @@ async def standup_add(
     voice_duration_minutes: app_commands.Range[int, 5, 180] = 20,
 ):
     db = interaction.client.db
+    _, timezone_name = await _get_guild_timezone(interaction.client, str(interaction.guild_id))
 
     time_list = [t.strip() for t in times.split(",")]
     for t in time_list:
@@ -49,7 +60,7 @@ async def standup_add(
             datetime.strptime(t, "%H:%M")
         except ValueError:
             await interaction.response.send_message(
-                f"❌ Invalid time format: `{t}`. Use HH:MM (24h UTC), e.g. `09:00`",
+                f"❌ Invalid time format: `{t}`. Use HH:MM in your configured server timezone (`{timezone_name}`), e.g. `09:00`",
                 ephemeral=True
             )
             return
@@ -73,7 +84,7 @@ async def standup_add(
     embed.add_field(name="Name", value=name, inline=True)
     embed.add_field(name="ID", value=f"#{standup_id}", inline=True)
     embed.add_field(name="Channel", value=channel.mention, inline=True)
-    embed.add_field(name="Times (UTC)", value="\n".join(f"`{t}`" for t in time_list), inline=True)
+    embed.add_field(name=f"Times ({timezone_name})", value="\n".join(f"`{t}`" for t in time_list), inline=True)
     embed.add_field(name="Ping Role", value=ping_role.mention if ping_role else "None", inline=True)
     embed.add_field(name="Voice Room", value=f"`{voice_duration_minutes} min temporary room`", inline=True)
     embed.add_field(name="Meeting URL", value=meeting_url if meeting_url else "Discord voice only", inline=False)
@@ -86,6 +97,7 @@ async def standup_add(
 async def standup_list(interaction: discord.Interaction):
     db = interaction.client.db
     standups = await db.get_standups(str(interaction.guild_id), active_only=False)
+    tz, timezone_name = await _get_guild_timezone(interaction.client, str(interaction.guild_id))
 
     if not standups:
         await interaction.response.send_message(
@@ -102,7 +114,13 @@ async def standup_list(interaction: discord.Interaction):
 
     for s in standups:
         status = "🟢 Active" if s["active"] else "🔴 Paused"
-        last = s["last_sent"][:16].replace("T", " ") if s.get("last_sent") else "Never"
+        if s.get("last_sent"):
+            try:
+                last = datetime.fromisoformat(s["last_sent"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                last = s["last_sent"][:16].replace("T", " ")
+        else:
+            last = "Never"
         try:
             ch = interaction.guild.get_channel(int(s["channel_id"]))
             ch_mention = ch.mention if ch else f"<#{s['channel_id']}>"
@@ -113,7 +131,7 @@ async def standup_list(interaction: discord.Interaction):
             name=f"#{s['id']} — {s['name']} ({status})",
             value=(
                 f"📌 {ch_mention}\n"
-                f"⏰ `{s['cron_time']} UTC`\n"
+                f"⏰ `{s['cron_time']} {timezone_name}`\n"
                 f"🎙️ Temp room: `{int(s.get('voice_duration_minutes') or 20)} min`\n"
                 f"🔗 Meeting URL: {s.get('meeting_url') or 'Discord voice only'}\n"
                 f"📨 Last sent: `{last}`"

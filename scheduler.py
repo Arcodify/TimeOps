@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 import discord
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("StandupScheduler")
 
@@ -21,17 +22,26 @@ class StandupScheduler:
     def set_bot(self, bot):
         self.bot = bot
 
-    def _should_send(self, standup: dict) -> bool:
+    async def _get_standup_timezone(self, guild_id: str) -> tuple[ZoneInfo, str]:
+        config = await self.db.get_guild_config(guild_id)
+        timezone_name = config.get("timezone") or "UTC"
+        try:
+            return ZoneInfo(timezone_name), timezone_name
+        except Exception:
+            return ZoneInfo("UTC"), "UTC"
+
+    async def _should_send(self, standup: dict) -> bool:
         """Check if a standup should fire right now (within 1-min window)."""
         cron_time = standup["cron_time"]  # format: "HH:MM" or "HH:MM,HH:MM,..."
         times = [t.strip() for t in cron_time.split(",")]
-        
+
+        tz, _ = await self._get_standup_timezone(str(standup["guild_id"]))
         now_utc = datetime.utcnow()
-        now_str = now_utc.strftime("%H:%M")
-        
+        now_str = datetime.now(tz).strftime("%H:%M")
+
         if now_str not in times:
             return False
-        
+
         # Check if already sent in this minute window
         last_sent = standup.get("last_sent")
         if last_sent:
@@ -52,7 +62,7 @@ class StandupScheduler:
         await self._cleanup_voice_rooms()
         standups = await self.db.get_all_active_standups()
         for standup in standups:
-            if self._should_send(standup):
+            if await self._should_send(standup):
                 await self._send_standup(standup)
 
     async def _cleanup_voice_rooms(self):
@@ -87,7 +97,8 @@ class StandupScheduler:
         if category is None and hasattr(text_channel, "parent") and text_channel.parent is not None:
             category = getattr(text_channel.parent, "category", None)
 
-        scheduled_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        tz, timezone_name = await self._get_standup_timezone(str(standup["guild_id"]))
+        scheduled_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
         voice_name = f"{standup['name']} • {scheduled_time}"
         voice_duration_minutes = int(standup.get("voice_duration_minutes") or 20)
         voice_channel = await guild.create_voice_channel(
@@ -129,7 +140,8 @@ class StandupScheduler:
                 value=f"Temporary voice room stays open for about `{voice_duration_minutes}` minutes.",
                 inline=False,
             )
-            embed.set_footer(text="HR Bot • Standup")
+            _, timezone_name = await self._get_standup_timezone(str(standup["guild_id"]))
+            embed.set_footer(text=f"HR Bot • Standup • {timezone_name}")
 
             content = ""
             if standup.get("ping_role"):

@@ -97,7 +97,10 @@ PAGES = [
         "title": "⚙️ Admin Configuration",
         "color": 0x99AAB5,
         "fields": [
-            ("/hrconfig configure", "Set activity log channel, admin role, present role, on-break role, and timezone"),
+            ("/hrconfig configure", "Set activity log channel, admin role, present role, and on-break role"),
+            ("/hrconfig reset confirm:DELETE", "Delete all HR bot setup and data for this server *(Admin)*"),
+            ("/timezone set [value]", "Set the server timezone once for all bot features"),
+            ("/timezone view", "View the current server timezone"),
             ("/hrconfig view", "View current bot configuration"),
             ("/overtime config", "Set daily/weekly hours, break allowance, and blocked clock-in days"),
         ]

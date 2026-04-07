@@ -653,6 +653,34 @@ class Database:
             )
             await db.commit()
 
+    async def reset_guild_data(self, guild_id: str):
+        tables = [
+            "time_entries",
+            "leave_requests",
+            "standup_schedules",
+            "overtime_config",
+            "guild_config",
+            "work_rules",
+            "break_entries",
+            "scheduled_breaks",
+            "work_update_config",
+            "work_updates",
+            "reminder_config",
+            "holidays",
+        ]
+
+        async with aiosqlite.connect(self.path) as db:
+            for table in tables:
+                async with db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ) as cur:
+                    exists = await cur.fetchone()
+                if not exists:
+                    continue
+                await db.execute(f"DELETE FROM {table} WHERE guild_id=?", (guild_id,))
+            await db.commit()
+
     async def get_work_update_config(self, guild_id: str) -> Dict:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
