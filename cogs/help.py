@@ -28,8 +28,8 @@ PAGES = [
             ("/break start [type]", "Start a manual break — can assign the configured On Break role"),
             ("/break end", "End your current break"),
             ("/break status", "View break history for your active session"),
-            ("/break configure [break1...] [break2...]", "Set up to two scheduled company break windows *(Admin)*"),
-            ("/break schedule", "View the configured automatic break windows"),
+            ("/break configure [break1...] [break2...]", "Set up to two scheduled company break windows that auto-mark staff on break *(Admin)*"),
+            ("/break schedule", "View the configured scheduled break windows"),
         ]
     },
     {
