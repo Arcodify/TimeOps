@@ -28,7 +28,7 @@ PAGES = [
             ("/break start [type]", "Start a manual break — can assign the configured On Break role"),
             ("/break end", "End your current break"),
             ("/break status", "View break history for your active session"),
-            ("/break configure [break1...] [break2...]", "Set up to two automatic company break windows *(Admin)*"),
+            ("/break configure [break1...] [break2...]", "Set up to two scheduled company break windows *(Admin)*"),
             ("/break schedule", "View the configured automatic break windows"),
         ]
     },
@@ -50,7 +50,7 @@ PAGES = [
             ("/standup list", "List all standup schedules"),
             ("/standup pause", "Pause or resume a standup *(Admin)*"),
             ("/standup delete", "Remove a standup schedule *(Admin)*"),
-            ("/standup test", "Fire a standup now and create its temporary voice room *(Admin)*"),
+            ("/standup test", "Fire a standup now with its temporary voice room and standup form *(Admin)*"),
         ]
     },
     {
@@ -70,7 +70,7 @@ PAGES = [
         "color": 0x5865F2,
         "fields": [
             ("/update status", "View periodic work-update prompt settings"),
-            ("/update config [enabled] [interval_hours] [question] [archive_channel]", "Set prompt timing, question, and archive channel *(Admin)*"),
+            ("/update config [enabled] [interval_hours] [update_times] [question] [archive_channel]", "Set interval prompts or fixed time-shift update times *(Admin)*"),
             ("/update submit", "Submit your pending work update"),
         ]
     },

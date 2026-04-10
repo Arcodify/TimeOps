@@ -125,6 +125,12 @@ async def report_overtime(interaction: discord.Interaction, period: str = "week"
     guild_id = str(interaction.guild_id)
     entries = await db.get_all_entries_range(guild_id, start, end)
     config = await db.get_overtime_config(guild_id)
+    if (config.get("mode") or "overtime") != "overtime":
+        await interaction.followup.send(
+            "⚠️ Overtime reporting is only available while the server is using `overtime` mode.",
+            ephemeral=True,
+        )
+        return
 
     from collections import defaultdict
     user_data = defaultdict(lambda: {"username": "", "entry_count": 0})
@@ -274,14 +280,15 @@ async def report_mine(interaction: discord.Interaction, period: str = "week"):
     embed.add_field(name="Days Worked", value=str(summary["days_worked"]), inline=True)
     embed.add_field(name="Sessions", value=str(summary["entry_count"]), inline=True)
 
-    expected = config["daily_hours"] * 60 * summary["days_worked"]
-    embed.add_field(name="Expected Hours", value=fmt_duration(int(expected)), inline=True)
+    if (config.get("mode") or "overtime") == "overtime":
+        expected = config["daily_hours"] * 60 * summary["days_worked"]
+        embed.add_field(name="Expected Hours", value=fmt_duration(int(expected)), inline=True)
 
-    if summary["overtime_minutes"] > 0:
-        embed.add_field(name="⚡ Overtime", value=f"**+{fmt_duration(summary['overtime_minutes'])}**", inline=True)
-    elif summary["total_minutes"] < expected and summary["days_worked"] > 0:
-        under = int(expected - summary["total_minutes"])
-        embed.add_field(name="⚠️ Under Hours", value=f"-{fmt_duration(under)}", inline=True)
+        if summary["overtime_minutes"] > 0:
+            embed.add_field(name="⚡ Overtime", value=f"**+{fmt_duration(summary['overtime_minutes'])}**", inline=True)
+        elif summary["total_minutes"] < expected and summary["days_worked"] > 0:
+            under = int(expected - summary["total_minutes"])
+            embed.add_field(name="⚠️ Under Hours", value=f"-{fmt_duration(under)}", inline=True)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 

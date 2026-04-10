@@ -7,7 +7,6 @@ Break time is subtracted from total worked hours.
 
 import discord
 from discord.ext import commands
-from discord.ext.tasks import loop
 from discord import app_commands
 import logging
 from datetime import datetime
@@ -90,91 +89,6 @@ class Breaks(commands.Cog):
             if "reason" not in columns:
                 await db.execute("ALTER TABLE break_entries ADD COLUMN reason TEXT")
             await db.commit()
-        self.scheduled_break_loop.start()
-
-    async def cog_unload(self):
-        self.scheduled_break_loop.cancel()
-
-    @loop(minutes=1)
-    async def scheduled_break_loop(self):
-        for guild in self.bot.guilds:
-            current_schedule = await _get_current_scheduled_break(self.bot, guild)
-            active_entries = await self.bot.db.get_active_entries_for_guild(str(guild.id))
-
-            for entry in active_entries:
-                member = guild.get_member(int(entry["user_id"]))
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(int(entry["user_id"]))
-                    except Exception:
-                        member = None
-
-                active_break = await _get_active_break(self.bot.db.path, str(guild.id), entry["user_id"])
-
-                if active_break and active_break.get("break_type") == "scheduled":
-                    active_name = active_break.get("reason") or ""
-                    if current_schedule is None or active_name != current_schedule["name"]:
-                        result = await _end_break(self.bot.db.path, str(guild.id), entry["user_id"])
-                        if member is not None:
-                            try:
-                                await _clear_on_break_role(self.bot, guild, member)
-                            except Exception:
-                                pass
-                        if result:
-                            await post_activity_log(
-                                self.bot,
-                                str(guild.id),
-                                title="✅ Automatic Break Ended",
-                                color=0x57F287,
-                                fields=[
-                                    ("Employee", entry["username"], True),
-                                    ("Break", _label_break(result), True),
-                                    ("Duration", f"`{fmt_duration(result['duration_minutes'])}`", True),
-                                ],
-                            )
-                    continue
-
-                if current_schedule is None or active_break:
-                    continue
-
-                session_breaks = await _get_session_breaks(
-                    self.bot.db.path,
-                    str(guild.id),
-                    entry["user_id"],
-                    entry["id"],
-                )
-                already_started = any(
-                    item.get("break_type") == "scheduled" and (item.get("reason") or "") == current_schedule["name"]
-                    for item in session_breaks
-                )
-                if already_started:
-                    continue
-
-                await _start_break(
-                    self.bot.db.path,
-                    str(guild.id),
-                    entry["user_id"],
-                    entry["username"],
-                    "scheduled",
-                    entry["id"],
-                    reason=current_schedule["name"],
-                )
-                if member is not None:
-                    try:
-                        await _apply_on_break_role(self.bot, guild, member)
-                    except Exception:
-                        pass
-                await post_activity_log(
-                    self.bot,
-                    str(guild.id),
-                    title="☕ Automatic Break Started",
-                    color=0xFEE75C,
-                    fields=[
-                        ("Employee", entry["username"], True),
-                        ("Break", current_schedule["name"], True),
-                        ("Window", f"`{current_schedule['start_time']}` → `{current_schedule['end_time']}`", True),
-                    ],
-                )
 
 
 async def _get_active_break(db_path: str, guild_id: str, user_id: str):
@@ -261,24 +175,6 @@ async def _get_session_breaks(db_path: str, guild_id: str, user_id: str, entry_i
     return [dict(r) for r in rows]
 
 
-async def _get_active_auto_break_message(bot, guild: discord.Guild, active_break: dict | None) -> str | None:
-    if guild is None or not active_break or active_break.get("break_type") != "scheduled":
-        return None
-
-    schedule = await _get_current_scheduled_break(bot, guild)
-    if schedule is None:
-        return None
-
-    if (active_break.get("reason") or "") != schedule["name"]:
-        return None
-
-    _, timezone_name = await _get_guild_timezone(bot, str(guild.id))
-    return (
-        "⚠️ This is an automatic company break window.\n"
-        f"It will end at `{schedule['end_time']}` ({timezone_name})."
-    )
-
-
 @break_group.command(name="start", description="Start a break")
 @app_commands.describe(break_type="Type of break")
 @app_commands.choices(break_type=[
@@ -354,11 +250,6 @@ async def break_end(interaction: discord.Interaction):
     db_path = interaction.client.db.path
     guild_id = str(interaction.guild_id)
     user_id = str(interaction.user.id)
-    active_break = await _get_active_break(db_path, guild_id, user_id)
-    auto_break_message = await _get_active_auto_break_message(interaction.client, interaction.guild, active_break)
-    if auto_break_message:
-        await interaction.response.send_message(auto_break_message, ephemeral=True)
-        return
 
     result = await _end_break(db_path, guild_id, user_id)
     if not result:
@@ -441,7 +332,7 @@ async def break_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@break_group.command(name="configure", description="Configure up to two automatic company break periods")
+@break_group.command(name="configure", description="Configure up to two scheduled company break periods")
 @app_commands.describe(
     break1_name="Label for the first scheduled break",
     break1_start="First break start in HH:MM server timezone",
@@ -501,26 +392,26 @@ async def break_configure(
     await interaction.client.db.replace_scheduled_breaks(str(interaction.guild_id), schedules)
     _, timezone_name = await _get_guild_timezone(interaction.client, str(interaction.guild_id))
 
-    embed = discord.Embed(title="☕ Automatic Breaks Configured", color=0x57F287)
+    embed = discord.Embed(title="☕ Scheduled Breaks Configured", color=0x57F287)
     for schedule in schedules:
         embed.add_field(
             name=schedule["name"],
             value=f"`{schedule['start_time']}` → `{schedule['end_time']}` ({timezone_name})",
             inline=True,
         )
-    embed.set_footer(text="Clocked-in staff will be auto-marked on break during these windows.")
+    embed.set_footer(text="These windows are used as scheduled break allowance only. Staff are not auto-marked on break.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@break_group.command(name="schedule", description="View configured automatic company break periods")
+@break_group.command(name="schedule", description="View configured scheduled company break periods")
 async def break_schedule(interaction: discord.Interaction):
     schedules = await interaction.client.db.get_scheduled_breaks(str(interaction.guild_id), active_only=False)
     if not schedules:
-        await interaction.response.send_message("No automatic break periods configured.", ephemeral=True)
+        await interaction.response.send_message("No scheduled break periods configured.", ephemeral=True)
         return
 
     _, timezone_name = await _get_guild_timezone(interaction.client, str(interaction.guild_id))
-    embed = discord.Embed(title="☕ Automatic Break Periods", color=0x5865F2)
+    embed = discord.Embed(title="☕ Scheduled Break Periods", color=0x5865F2)
     for schedule in schedules:
         embed.add_field(
             name=schedule["name"],

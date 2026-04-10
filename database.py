@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import os
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("Database")
 DB_PATH = "data/hrbot.db"
@@ -65,6 +66,25 @@ def normalize_blocked_weekdays(value) -> str:
     return ",".join(str(day) for day in parse_blocked_weekdays(value))
 
 
+def parse_hhmm(value: str):
+    return datetime.strptime(value, "%H:%M").time()
+
+
+def break_minutes_from_schedules(schedules: List[Dict]) -> int:
+    total = 0
+    for schedule in schedules:
+        try:
+            start = parse_hhmm(schedule["start_time"])
+            end = parse_hhmm(schedule["end_time"])
+        except Exception:
+            continue
+        start_minutes = start.hour * 60 + start.minute
+        end_minutes = end.hour * 60 + end.minute
+        if end_minutes > start_minutes:
+            total += end_minutes - start_minutes
+    return total
+
+
 class Database:
     def __init__(self):
         self.path = DB_PATH
@@ -112,14 +132,22 @@ class Database:
                     voice_duration_minutes INTEGER DEFAULT 20,
                     active      INTEGER DEFAULT 1,
                     ping_role   TEXT,
+                    form_title_1 TEXT DEFAULT 'What did you work on?',
+                    form_title_2 TEXT DEFAULT 'What will you work on next?',
+                    form_title_3 TEXT DEFAULT 'Any blockers or notes?',
+                    form_title_3_optional INTEGER DEFAULT 1,
                     last_sent   TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS overtime_config (
                     guild_id    TEXT PRIMARY KEY,
+                    mode        TEXT DEFAULT 'overtime',
                     daily_hours REAL DEFAULT 8.0,
                     weekly_hours REAL DEFAULT 40.0,
-                    auto_out_hours REAL DEFAULT 12.0
+                    auto_out_hours REAL DEFAULT 12.0,
+                    shift_clock_in_time TEXT,
+                    shift_clock_out_time TEXT,
+                    default_clock_out_time TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS guild_config (
@@ -164,6 +192,7 @@ class Database:
                     guild_id        TEXT PRIMARY KEY,
                     enabled         INTEGER DEFAULT 0,
                     interval_hours  REAL DEFAULT 2.0,
+                    update_times    TEXT,
                     question_text   TEXT DEFAULT 'What did you work on?',
                     archive_channel_id TEXT
                 );
@@ -181,6 +210,23 @@ class Database:
                     content         TEXT,
                     UNIQUE(time_entry_id, prompt_slot)
                 );
+
+                CREATE TABLE IF NOT EXISTS standup_submissions (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id        TEXT NOT NULL,
+                    standup_id      INTEGER NOT NULL,
+                    occurrence_key  TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    username        TEXT NOT NULL,
+                    title_1         TEXT NOT NULL,
+                    response_1      TEXT,
+                    title_2         TEXT NOT NULL,
+                    response_2      TEXT,
+                    title_3         TEXT NOT NULL,
+                    response_3      TEXT,
+                    submitted_at    TEXT NOT NULL,
+                    UNIQUE(standup_id, occurrence_key, user_id)
+                );
             """)
             columns = {
                 row[1]
@@ -192,6 +238,18 @@ class Database:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN on_break_role_id TEXT")
             if "activity_log_channel_id" not in columns:
                 await db.execute("ALTER TABLE guild_config ADD COLUMN activity_log_channel_id TEXT")
+            overtime_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(overtime_config)")).fetchall()
+            }
+            if "mode" not in overtime_columns:
+                await db.execute("ALTER TABLE overtime_config ADD COLUMN mode TEXT DEFAULT 'overtime'")
+            if "shift_clock_in_time" not in overtime_columns:
+                await db.execute("ALTER TABLE overtime_config ADD COLUMN shift_clock_in_time TEXT")
+            if "shift_clock_out_time" not in overtime_columns:
+                await db.execute("ALTER TABLE overtime_config ADD COLUMN shift_clock_out_time TEXT")
+            if "default_clock_out_time" not in overtime_columns:
+                await db.execute("ALTER TABLE overtime_config ADD COLUMN default_clock_out_time TEXT")
             standup_columns = {
                 row[1]
                 for row in await (await db.execute("PRAGMA table_info(standup_schedules)")).fetchall()
@@ -200,10 +258,28 @@ class Database:
                 await db.execute("ALTER TABLE standup_schedules ADD COLUMN meeting_url TEXT")
             if "voice_duration_minutes" not in standup_columns:
                 await db.execute("ALTER TABLE standup_schedules ADD COLUMN voice_duration_minutes INTEGER DEFAULT 20")
+            if "form_title_1" not in standup_columns:
+                await db.execute(
+                    "ALTER TABLE standup_schedules ADD COLUMN form_title_1 TEXT DEFAULT 'What did you work on?'"
+                )
+            if "form_title_2" not in standup_columns:
+                await db.execute(
+                    "ALTER TABLE standup_schedules ADD COLUMN form_title_2 TEXT DEFAULT 'What will you work on next?'"
+                )
+            if "form_title_3" not in standup_columns:
+                await db.execute(
+                    "ALTER TABLE standup_schedules ADD COLUMN form_title_3 TEXT DEFAULT 'Any blockers or notes?'"
+                )
+            if "form_title_3_optional" not in standup_columns:
+                await db.execute(
+                    "ALTER TABLE standup_schedules ADD COLUMN form_title_3_optional INTEGER DEFAULT 1"
+                )
             update_config_columns = {
                 row[1]
                 for row in await (await db.execute("PRAGMA table_info(work_update_config)")).fetchall()
             }
+            if "update_times" not in update_config_columns:
+                await db.execute("ALTER TABLE work_update_config ADD COLUMN update_times TEXT")
             if "question_text" not in update_config_columns:
                 await db.execute(
                     "ALTER TABLE work_update_config ADD COLUMN question_text TEXT DEFAULT 'What did you work on?'"
@@ -258,6 +334,20 @@ class Database:
                 "UPDATE time_entries SET clock_out=?, duration_minutes=?, auto_out=? WHERE id=?",
                 (now.isoformat(), duration, 1 if auto else 0, active["id"])
             )
+            async with db.execute(
+                "SELECT id, break_start FROM break_entries "
+                "WHERE guild_id=? AND user_id=? AND time_entry_id=? AND break_end IS NULL "
+                "ORDER BY break_start DESC LIMIT 1",
+                (guild_id, user_id, active["id"])
+            ) as cur:
+                break_row = await cur.fetchone()
+            if break_row:
+                break_start = datetime.fromisoformat(break_row[1])
+                break_duration = int((now - break_start).total_seconds() / 60)
+                await db.execute(
+                    "UPDATE break_entries SET break_end=?, duration_minutes=? WHERE id=?",
+                    (now.isoformat(), break_duration, break_row[0])
+                )
             await db.commit()
         
         return {
@@ -294,71 +384,106 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT te.*, oc.auto_out_hours FROM time_entries te "
+                "SELECT te.*, gc.timezone, oc.mode, oc.auto_out_hours, oc.default_clock_out_time "
+                "FROM time_entries te "
                 "LEFT JOIN overtime_config oc ON te.guild_id = oc.guild_id "
+                "LEFT JOIN guild_config gc ON te.guild_id = gc.guild_id "
                 "WHERE te.clock_out IS NULL"
             ) as cur:
                 rows = await cur.fetchall()
-        
+
         for row in rows:
             row = dict(row)
-            limit_hours = row.get("auto_out_hours") or 12.0
             clock_in = datetime.fromisoformat(row["clock_in"])
-            if (datetime.utcnow() - clock_in).total_seconds() / 3600 >= limit_hours:
-                result = await self.clock_out(row["guild_id"], row["user_id"], auto=True)
-                log.info(f"Auto clock-out: {row['username']} after {limit_hours}h")
-                # Attempt to notify user
-                try:
-                    user = await bot.fetch_user(int(row["user_id"]))
-                    await user.send(
-                        f"⏰ **Auto Clock-Out Notice**\n"
-                        f"You were automatically clocked out after **{limit_hours:.0f} hours**.\n"
-                        f"Duration: **{result['duration_minutes']//60}h {result['duration_minutes']%60}m**\n"
-                        f"Use `/clockin` to clock back in."
+            mode = (row.get("mode") or "overtime").strip().lower()
+            should_auto_out = False
+            notice = None
+
+            if mode == "time_shift":
+                default_clock_out_time = (row.get("default_clock_out_time") or "").strip()
+                if default_clock_out_time:
+                    timezone_name = row.get("timezone") or "UTC"
+                    try:
+                        tz = ZoneInfo(timezone_name)
+                    except Exception:
+                        tz = ZoneInfo("UTC")
+                        timezone_name = "UTC"
+                    local_now = datetime.now(tz)
+                    local_clock_in = clock_in.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+                    cutoff_time = parse_hhmm(default_clock_out_time)
+                    cutoff_local = local_clock_in.replace(
+                        hour=cutoff_time.hour,
+                        minute=cutoff_time.minute,
+                        second=0,
+                        microsecond=0,
                     )
-                except Exception:
-                    pass
-
-                try:
-                    from cogs.activity_log import post_activity_log
-
-                    await post_activity_log(
-                        bot,
-                        row["guild_id"],
-                        title="⏰ Auto Clocked Out",
-                        color=0xED4245,
-                        fields=[
-                            ("Employee", row["username"], True),
-                            ("Clock In", f"`{row['clock_in'].replace('T', ' ')[:16]} UTC`", True),
-                            ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
-                            ("Duration", f"`{result['duration_minutes']//60}h {result['duration_minutes']%60:02d}m`", True),
-                        ],
+                    should_auto_out = local_now >= cutoff_local
+                    notice = (
+                        f"You were automatically clocked out at the default shift end time "
+                        f"of **{default_clock_out_time}** ({timezone_name})."
                     )
-                except Exception:
-                    pass
+            else:
+                limit_hours = row.get("auto_out_hours") or 12.0
+                if limit_hours > 0 and (datetime.utcnow() - clock_in).total_seconds() / 3600 >= limit_hours:
+                    should_auto_out = True
+                    notice = f"You were automatically clocked out after **{limit_hours:.0f} hours**."
 
-                try:
-                    config = await self.get_guild_config(row["guild_id"])
-                    present_role_id = config.get("present_role_id")
-                    role_id = config.get("on_break_role_id")
-                    guild = bot.get_guild(int(row["guild_id"]))
-                    if guild and present_role_id:
+            if not should_auto_out:
+                continue
+
+            result = await self.clock_out(row["guild_id"], row["user_id"], auto=True)
+            log.info("Auto clock-out: %s", row["username"])
+            try:
+                user = await bot.fetch_user(int(row["user_id"]))
+                await user.send(
+                    "⏰ **Auto Clock-Out Notice**\n"
+                    f"{notice}\n"
+                    f"Duration: **{result['duration_minutes']//60}h {result['duration_minutes']%60}m**\n"
+                    "Use `/clockin` to clock back in."
+                )
+            except Exception:
+                pass
+
+            try:
+                from cogs.activity_log import post_activity_log
+
+                await post_activity_log(
+                    bot,
+                    row["guild_id"],
+                    title="⏰ Auto Clocked Out",
+                    color=0xED4245,
+                    fields=[
+                        ("Employee", row["username"], True),
+                        ("Clock In", f"`{row['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+                        ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
+                        ("Duration", f"`{result['duration_minutes']//60}h {result['duration_minutes']%60:02d}m`", True),
+                    ],
+                )
+            except Exception:
+                pass
+
+            try:
+                config = await self.get_guild_config(row["guild_id"])
+                present_role_id = config.get("present_role_id")
+                role_id = config.get("on_break_role_id")
+                guild = bot.get_guild(int(row["guild_id"]))
+                if guild and present_role_id:
+                    member = guild.get_member(int(row["user_id"]))
+                    if member is None:
+                        member = await guild.fetch_member(int(row["user_id"]))
+                    role = guild.get_role(int(present_role_id))
+                    if member and role and role in member.roles:
+                        await member.remove_roles(role, reason="Auto clock-out removed present role")
+                if role_id:
+                    if guild:
                         member = guild.get_member(int(row["user_id"]))
                         if member is None:
                             member = await guild.fetch_member(int(row["user_id"]))
-                        role = guild.get_role(int(present_role_id))
+                        role = guild.get_role(int(role_id))
                         if member and role and role in member.roles:
-                            await member.remove_roles(role, reason="Auto clock-out removed present role")
-                    if role_id:
-                        if guild:
-                            member = guild.get_member(int(row["user_id"]))
-                            if member is None:
-                                member = await guild.fetch_member(int(row["user_id"]))
-                            role = guild.get_role(int(role_id))
-                            if member and role and role in member.roles:
-                                await member.remove_roles(role, reason="Auto clock-out removed on-break role")
-                except Exception:
-                    pass
+                            await member.remove_roles(role, reason="Auto clock-out removed on-break role")
+            except Exception:
+                pass
 
     # ─── QUERIES ─────────────────────────────────────────────────────────────
 
@@ -388,17 +513,18 @@ class Database:
         """Total minutes worked, overtime, entry count for range."""
         entries = await self.get_entries_range(guild_id, user_id, start, end)
         config = await self.get_overtime_config(guild_id)
-        rules = await self.get_work_rules(guild_id)
-        
+
         gross_minutes = sum(e["duration_minutes"] or 0 for e in entries if e["clock_out"])
         days_worked = len(set(e["clock_in"][:10] for e in entries))
         break_minutes = await self.get_break_minutes_for_range(guild_id, user_id, start, end)
-        default_break_minutes = float(rules.get("default_break_minutes") or 0)
-        expected_break_minutes = int(default_break_minutes * days_worked)
+        expected_break_minutes = await self.get_expected_break_minutes(guild_id)
+        expected_break_minutes *= days_worked
         applied_break_minutes = max(break_minutes, expected_break_minutes)
         total_minutes = max(0, gross_minutes - applied_break_minutes)
-        expected_minutes = config["daily_hours"] * 60 * days_worked
-        overtime_minutes = max(0, total_minutes - expected_minutes)
+        overtime_minutes = 0
+        if (config.get("mode") or "overtime") == "overtime":
+            expected_minutes = config["daily_hours"] * 60 * days_worked
+            overtime_minutes = max(0, total_minutes - expected_minutes)
         
         return {
             "gross_minutes": gross_minutes,
@@ -475,12 +601,33 @@ class Database:
         ping_role=None,
         meeting_url=None,
         voice_duration_minutes: int = 20,
+        form_title_1: str = "What did you work on?",
+        form_title_2: str = "What will you work on next?",
+        form_title_3: str = "Any blockers or notes?",
+        form_title_3_optional: bool = True,
     ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "INSERT INTO standup_schedules (guild_id, channel_id, name, cron_time, message, ping_role, meeting_url, voice_duration_minutes) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (guild_id, channel_id, name, cron_time, message, ping_role, meeting_url, voice_duration_minutes)
+                """
+                INSERT INTO standup_schedules
+                (guild_id, channel_id, name, cron_time, message, ping_role, meeting_url, voice_duration_minutes,
+                 form_title_1, form_title_2, form_title_3, form_title_3_optional)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    name,
+                    cron_time,
+                    message,
+                    ping_role,
+                    meeting_url,
+                    voice_duration_minutes,
+                    form_title_1,
+                    form_title_2,
+                    form_title_3,
+                    1 if form_title_3_optional else 0,
+                )
             )
             await db.commit()
             return cursor.lastrowid
@@ -525,15 +672,41 @@ class Database:
             async with db.execute("SELECT * FROM overtime_config WHERE guild_id=?", (guild_id,)) as cur:
                 row = await cur.fetchone()
         if row:
-            return dict(row)
-        return {"guild_id": guild_id, "daily_hours": 8.0, "weekly_hours": 40.0, "auto_out_hours": 12.0}
+            data = dict(row)
+            data["mode"] = (data.get("mode") or "overtime").strip().lower()
+            return data
+        return {
+            "guild_id": guild_id,
+            "mode": "overtime",
+            "daily_hours": 8.0,
+            "weekly_hours": 40.0,
+            "auto_out_hours": 12.0,
+            "shift_clock_in_time": None,
+            "shift_clock_out_time": None,
+            "default_clock_out_time": None,
+        }
 
-    async def set_overtime_config(self, guild_id: str, daily_hours: float, weekly_hours: float, auto_out_hours: float):
+    async def set_overtime_config(self, guild_id: str, **kwargs):
+        existing = await self.get_overtime_config(guild_id)
+        existing.update(kwargs)
+        existing["mode"] = (existing.get("mode") or "overtime").strip().lower()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO overtime_config (guild_id, daily_hours, weekly_hours, auto_out_hours) "
-                "VALUES (?,?,?,?)",
-                (guild_id, daily_hours, weekly_hours, auto_out_hours)
+                """
+                INSERT OR REPLACE INTO overtime_config
+                (guild_id, mode, daily_hours, weekly_hours, auto_out_hours, shift_clock_in_time, shift_clock_out_time, default_clock_out_time)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    guild_id,
+                    existing.get("mode", "overtime"),
+                    existing.get("daily_hours", 8.0),
+                    existing.get("weekly_hours", 40.0),
+                    existing.get("auto_out_hours", 12.0),
+                    existing.get("shift_clock_in_time"),
+                    existing.get("shift_clock_out_time"),
+                    existing.get("default_clock_out_time"),
+                )
             )
             await db.commit()
 
@@ -545,6 +718,20 @@ class Database:
             ) as cur:
                 row = await cur.fetchone()
         return int(row[0] or 0)
+
+    async def get_expected_break_minutes(self, guild_id: str) -> int:
+        schedules = await self.get_scheduled_breaks(guild_id)
+        scheduled_minutes = break_minutes_from_schedules(schedules)
+        if scheduled_minutes > 0:
+            return scheduled_minutes
+
+        rules = await self.get_work_rules(guild_id)
+        return int(float(rules.get("default_break_minutes") or 0))
+
+    async def get_applied_break_minutes_for_entry(self, guild_id: str, entry_id: int) -> int:
+        actual_minutes = await self.get_break_minutes_for_entry(entry_id)
+        expected_minutes = await self.get_expected_break_minutes(guild_id)
+        return max(actual_minutes, expected_minutes)
 
     async def get_break_minutes_for_range(self, guild_id: str, user_id: str, start: datetime, end: datetime) -> int:
         async with aiosqlite.connect(self.path) as db:
@@ -658,6 +845,7 @@ class Database:
             "time_entries",
             "leave_requests",
             "standup_schedules",
+            "standup_submissions",
             "overtime_config",
             "guild_config",
             "work_rules",
@@ -692,6 +880,7 @@ class Database:
             "guild_id": guild_id,
             "enabled": 0,
             "interval_hours": 2.0,
+            "update_times": None,
             "question_text": "What did you work on?",
             "archive_channel_id": None,
         }
@@ -701,6 +890,7 @@ class Database:
         guild_id: str,
         enabled: bool,
         interval_hours: float,
+        update_times: str,
         question_text: str,
         archive_channel_id: str = None,
     ):
@@ -708,10 +898,17 @@ class Database:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO work_update_config
-                (guild_id, enabled, interval_hours, question_text, archive_channel_id)
-                VALUES (?,?,?,?,?)
+                (guild_id, enabled, interval_hours, update_times, question_text, archive_channel_id)
+                VALUES (?,?,?,?,?,?)
                 """,
-                (guild_id, 1 if enabled else 0, interval_hours, question_text, archive_channel_id)
+                (
+                    guild_id,
+                    1 if enabled else 0,
+                    interval_hours,
+                    update_times,
+                    question_text,
+                    archive_channel_id,
+                )
             )
             await db.commit()
 
@@ -719,7 +916,7 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM work_update_config WHERE enabled=1 AND interval_hours > 0"
+                "SELECT * FROM work_update_config WHERE enabled=1"
             ) as cur:
                 rows = await cur.fetchall()
         return [dict(row) for row in rows]
@@ -823,3 +1020,52 @@ class Database:
             ) as cur:
                 row = await cur.fetchone()
         return dict(row) if row else None
+
+    async def submit_standup_submission(
+        self,
+        guild_id: str,
+        standup_id: int,
+        occurrence_key: str,
+        user_id: str,
+        username: str,
+        title_1: str,
+        response_1: str,
+        title_2: str,
+        response_2: str,
+        title_3: str,
+        response_3: str,
+    ):
+        submitted_at = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO standup_submissions
+                (guild_id, standup_id, occurrence_key, user_id, username, title_1, response_1, title_2, response_2, title_3, response_3, submitted_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(standup_id, occurrence_key, user_id)
+                DO UPDATE SET
+                    username=excluded.username,
+                    title_1=excluded.title_1,
+                    response_1=excluded.response_1,
+                    title_2=excluded.title_2,
+                    response_2=excluded.response_2,
+                    title_3=excluded.title_3,
+                    response_3=excluded.response_3,
+                    submitted_at=excluded.submitted_at
+                """,
+                (
+                    guild_id,
+                    standup_id,
+                    occurrence_key,
+                    user_id,
+                    username,
+                    title_1,
+                    response_1,
+                    title_2,
+                    response_2,
+                    title_3,
+                    response_3,
+                    submitted_at,
+                )
+            )
+            await db.commit()

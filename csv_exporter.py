@@ -104,8 +104,8 @@ class CSVExporter:
             summary = await self.db.get_user_summary(guild_id, uid, start, end)
             days = summary["days_worked"]
             total_mins = summary["total_minutes"]
-            expected_mins = config["daily_hours"] * 60 * days
-            overtime_mins = max(0, total_mins - expected_mins)
+            expected_mins = config["daily_hours"] * 60 * days if (config.get("mode") or "overtime") == "overtime" else 0
+            overtime_mins = max(0, total_mins - expected_mins) if expected_mins > 0 else 0
             
             rows.append({
                 "Employee": u["username"],

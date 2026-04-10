@@ -11,8 +11,9 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 import re
+from typing import Optional
 from zoneinfo import ZoneInfo
-from database import normalize_blocked_weekdays
+from database import normalize_blocked_weekdays, parse_hhmm
 
 log = logging.getLogger("Admin")
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -20,6 +21,10 @@ WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 admin_group = app_commands.Group(name="hrconfig", description="HR Bot server configuration")
 overtime_group = app_commands.Group(name="overtime", description="Overtime configuration")
 timezone_group = app_commands.Group(name="timezone", description="Guild timezone configuration")
+
+
+def _mode_label(value: str) -> str:
+    return "Time Shift" if (value or "").strip().lower() == "time_shift" else "Overtime"
 
 
 def _weekday_labels(blocked_weekdays: str) -> str:
@@ -221,9 +226,27 @@ async def hrview(interaction: discord.Interaction):
     )
 
     embed.add_field(name="Timezone", value=f"`{config.get('timezone', 'UTC')}`", inline=True)
-    embed.add_field(name="Daily Work Hours", value=f"`{ot_config['daily_hours']}h`", inline=True)
-    embed.add_field(name="Weekly Work Hours", value=f"`{ot_config['weekly_hours']}h`", inline=True)
-    embed.add_field(name="Auto Clock-Out After", value=f"`{ot_config['auto_out_hours']}h`", inline=True)
+    embed.add_field(name="Time Mode", value=f"`{_mode_label(ot_config.get('mode'))}`", inline=True)
+    if (ot_config.get("mode") or "overtime") == "time_shift":
+        embed.add_field(
+            name="Clock In Opens",
+            value=f"`{ot_config.get('shift_clock_in_time') or 'Not configured'}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Clock Out From",
+            value=f"`{ot_config.get('shift_clock_out_time') or 'Not configured'}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Default Clock-Out",
+            value=f"`{ot_config.get('default_clock_out_time') or 'Not configured'}`",
+            inline=True,
+        )
+    else:
+        embed.add_field(name="Daily Work Hours", value=f"`{ot_config['daily_hours']}h`", inline=True)
+        embed.add_field(name="Weekly Work Hours", value=f"`{ot_config['weekly_hours']}h`", inline=True)
+        embed.add_field(name="Auto Clock-Out After", value=f"`{ot_config['auto_out_hours']}h`", inline=True)
     embed.add_field(name="Default Break", value=f"`{work_rules['default_break_minutes']} min`", inline=True)
     embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(work_rules.get("blocked_weekdays")), inline=True)
 
@@ -312,52 +335,132 @@ async def timezone_view(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@overtime_group.command(name="config", description="Configure overtime and auto clock-out rules")
+@overtime_group.command(name="config", description="Configure overtime mode or fixed time-shift mode")
 @app_commands.describe(
-    daily_hours="Standard work hours per day (default 8)",
-    weekly_hours="Standard work hours per week (default 40)",
-    auto_out_hours="Auto clock-out after this many hours if user forgets (default 12, 0 to disable)",
-    default_break_minutes="Default break allowance per workday in minutes (default 60)",
-    blocked_weekdays="Comma-separated blocked clock-in days (default sat)"
+    mode="Choose whether the server uses overtime rules or fixed time-shift rules",
+    daily_hours="Standard work hours per day for overtime mode",
+    weekly_hours="Standard work hours per week for overtime mode",
+    auto_out_hours="Auto clock-out after this many hours in overtime mode (0 to disable)",
+    shift_clock_in_time="Time-shift clock-in opening time in HH:MM server timezone",
+    shift_clock_out_time="Time-shift clock-out start time in HH:MM server timezone",
+    default_clock_out_time="Time-shift default clock-out time in HH:MM server timezone",
+    default_break_minutes="Default break allowance per workday in minutes when no scheduled break windows exist",
+    blocked_weekdays="Comma-separated blocked clock-in days"
 )
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Overtime", value="overtime"),
+    app_commands.Choice(name="Time Shift", value="time_shift"),
+])
 @app_commands.checks.has_permissions(manage_guild=True)
 async def overtime_config(
     interaction: discord.Interaction,
-    daily_hours: float = 8.0,
-    weekly_hours: float = 40.0,
-    auto_out_hours: float = 12.0,
-    default_break_minutes: float = 60.0,
-    blocked_weekdays: str = "sat"
+    mode: Optional[str] = None,
+    daily_hours: Optional[float] = None,
+    weekly_hours: Optional[float] = None,
+    auto_out_hours: Optional[float] = None,
+    shift_clock_in_time: Optional[str] = None,
+    shift_clock_out_time: Optional[str] = None,
+    default_clock_out_time: Optional[str] = None,
+    default_break_minutes: Optional[float] = None,
+    blocked_weekdays: Optional[str] = None,
 ):
     db = interaction.client.db
+    guild_id = str(interaction.guild_id)
+    current_config = await db.get_overtime_config(guild_id)
+    current_rules = await db.get_work_rules(guild_id)
 
-    if daily_hours <= 0 or weekly_hours <= 0:
-        await interaction.response.send_message("❌ Hours must be positive.", ephemeral=True)
+    selected_mode = (mode or current_config.get("mode") or "overtime").strip().lower()
+    if selected_mode not in {"overtime", "time_shift"}:
+        await interaction.response.send_message("❌ Invalid mode.", ephemeral=True)
         return
+
+    if default_break_minutes is None:
+        default_break_minutes = float(current_rules.get("default_break_minutes") or 0)
+    if blocked_weekdays is None:
+        blocked_weekdays = current_rules.get("blocked_weekdays") or "sat"
     if default_break_minutes < 0:
         await interaction.response.send_message("❌ Default break minutes cannot be negative.", ephemeral=True)
         return
 
-    await db.set_overtime_config(
-        str(interaction.guild_id), daily_hours, weekly_hours, auto_out_hours
-    )
+    payload = {"mode": selected_mode}
+    if selected_mode == "time_shift":
+        shift_clock_in_time = (shift_clock_in_time or current_config.get("shift_clock_in_time") or "").strip()
+        shift_clock_out_time = (shift_clock_out_time or current_config.get("shift_clock_out_time") or "").strip()
+        default_clock_out_time = (default_clock_out_time or current_config.get("default_clock_out_time") or "").strip()
+        if not all((shift_clock_in_time, shift_clock_out_time, default_clock_out_time)):
+            await interaction.response.send_message(
+                "❌ Time-shift mode needs `shift_clock_in_time`, `shift_clock_out_time`, and `default_clock_out_time` in HH:MM format.",
+                ephemeral=True,
+            )
+            return
+        try:
+            start_time = parse_hhmm(shift_clock_in_time)
+            end_time = parse_hhmm(shift_clock_out_time)
+            default_out_time = parse_hhmm(default_clock_out_time)
+        except ValueError:
+            await interaction.response.send_message("❌ Time-shift times must use HH:MM format.", ephemeral=True)
+            return
+        if end_time <= start_time:
+            await interaction.response.send_message(
+                "❌ `shift_clock_out_time` must be later than `shift_clock_in_time`.",
+                ephemeral=True,
+            )
+            return
+        if default_out_time < end_time:
+            await interaction.response.send_message(
+                "❌ `default_clock_out_time` must be the same as or later than `shift_clock_out_time`.",
+                ephemeral=True,
+            )
+            return
+        payload.update(
+            {
+                "shift_clock_in_time": shift_clock_in_time,
+                "shift_clock_out_time": shift_clock_out_time,
+                "default_clock_out_time": default_clock_out_time,
+            }
+        )
+    else:
+        daily_hours = daily_hours if daily_hours is not None else float(current_config.get("daily_hours") or 8.0)
+        weekly_hours = weekly_hours if weekly_hours is not None else float(current_config.get("weekly_hours") or 40.0)
+        auto_out_hours = auto_out_hours if auto_out_hours is not None else float(current_config.get("auto_out_hours") or 12.0)
+        if daily_hours <= 0 or weekly_hours <= 0:
+            await interaction.response.send_message("❌ Hours must be positive.", ephemeral=True)
+            return
+        payload.update(
+            {
+                "daily_hours": daily_hours,
+                "weekly_hours": weekly_hours,
+                "auto_out_hours": auto_out_hours,
+            }
+        )
+
+    await db.set_overtime_config(guild_id, **payload)
     await db.set_work_rules(
-        str(interaction.guild_id),
+        guild_id,
         default_break_minutes=default_break_minutes,
         blocked_weekdays=blocked_weekdays
     )
 
-    embed = discord.Embed(title="⚡ Overtime Config Updated", color=0x57F287)
-    embed.add_field(name="Daily Hours", value=f"`{daily_hours}h`", inline=True)
-    embed.add_field(name="Weekly Hours", value=f"`{weekly_hours}h`", inline=True)
-    embed.add_field(
-        name="Auto Clock-Out",
-        value=f"`{auto_out_hours}h`" if auto_out_hours > 0 else "Disabled",
-        inline=True
-    )
+    embed = discord.Embed(title="⚙️ Time Config Updated", color=0x57F287)
+    embed.add_field(name="Mode", value=f"`{_mode_label(selected_mode)}`", inline=True)
+    if selected_mode == "time_shift":
+        embed.add_field(name="Clock In Opens", value=f"`{shift_clock_in_time}`", inline=True)
+        embed.add_field(name="Clock Out From", value=f"`{shift_clock_out_time}`", inline=True)
+        embed.add_field(name="Default Clock-Out", value=f"`{default_clock_out_time}`", inline=True)
+    else:
+        embed.add_field(name="Daily Hours", value=f"`{daily_hours}h`", inline=True)
+        embed.add_field(name="Weekly Hours", value=f"`{weekly_hours}h`", inline=True)
+        embed.add_field(
+            name="Auto Clock-Out",
+            value=f"`{auto_out_hours}h`" if auto_out_hours > 0 else "Disabled",
+            inline=True
+        )
     embed.add_field(name="Default Break", value=f"`{default_break_minutes} min`", inline=True)
     embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(blocked_weekdays), inline=True)
-    embed.set_footer(text="Overtime = worked hours − daily_hours × days_worked")
+    if selected_mode == "time_shift":
+        embed.set_footer(text="Clock-in and clock-out are enforced using the configured server timezone.")
+    else:
+        embed.set_footer(text="Overtime = worked hours − daily_hours × days_worked")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

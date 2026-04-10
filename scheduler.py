@@ -125,6 +125,13 @@ class StandupScheduler:
             voice_channel = await self._create_temp_voice_channel(standup, channel)
             voice_duration_minutes = int(standup.get("voice_duration_minutes") or 20)
             description = standup["message"] or "Standup is live. Join the meeting below."
+            occurrence_key = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            from cogs.standup import (
+                DEFAULT_FORM_TITLE_1,
+                DEFAULT_FORM_TITLE_2,
+                DEFAULT_FORM_TITLE_3,
+                build_standup_submission_view,
+            )
 
             embed = discord.Embed(
                 title=f"📢 {standup['name']}",
@@ -140,6 +147,16 @@ class StandupScheduler:
                 value=f"Temporary voice room stays open for about `{voice_duration_minutes}` minutes.",
                 inline=False,
             )
+            embed.add_field(
+                name="Standup Form",
+                value=(
+                    f"1. {standup.get('form_title_1') or DEFAULT_FORM_TITLE_1}\n"
+                    f"2. {standup.get('form_title_2') or DEFAULT_FORM_TITLE_2}\n"
+                    f"3. {standup.get('form_title_3') or DEFAULT_FORM_TITLE_3}"
+                    f" ({'optional' if standup.get('form_title_3_optional', 1) else 'required'})"
+                ),
+                inline=False,
+            )
             _, timezone_name = await self._get_standup_timezone(str(standup["guild_id"]))
             embed.set_footer(text=f"HR Bot • Standup • {timezone_name}")
 
@@ -147,7 +164,8 @@ class StandupScheduler:
             if standup.get("ping_role"):
                 content = f"<@&{standup['ping_role']}>"
 
-            await channel.send(content=content or None, embed=embed)
+            view = build_standup_submission_view(self.bot, standup, occurrence_key)
+            await channel.send(content=content or None, embed=embed, view=view)
             if update_last_sent:
                 await self.db.update_standup_last_sent(standup["id"], datetime.utcnow().isoformat())
             log.info(
