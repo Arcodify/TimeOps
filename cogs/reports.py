@@ -63,7 +63,17 @@ async def report_timesheet(
         await interaction.followup.send("📭 No time entries found for that period.", ephemeral=True)
         return
 
-    path = await exporter.export_timesheet(guild_id, label, start, end)
+    path = await exporter.export_timesheet(
+        guild_id,
+        label,
+        start,
+        end,
+        user_id=str(member.id) if member else None,
+    )
+    completed_entries = [entry for entry in entries if entry.get("clock_out")]
+    employee_count = len({entry["user_id"] for entry in entries})
+    gross_minutes = sum(entry["duration_minutes"] or 0 for entry in completed_entries)
+    in_progress_count = len(entries) - len(completed_entries)
 
     embed = discord.Embed(
         title="📊 Timesheet Report",
@@ -72,7 +82,14 @@ async def report_timesheet(
         timestamp=datetime.utcnow()
     )
     embed.add_field(name="Entries", value=str(len(entries)), inline=True)
+    embed.add_field(name="Employees", value=str(employee_count), inline=True)
     embed.add_field(name="Filter", value=member.mention if member else "All employees", inline=True)
+    embed.add_field(name="Gross Logged", value=fmt_duration(gross_minutes), inline=True)
+    embed.add_field(name="In Progress", value=str(in_progress_count), inline=True)
+    if member:
+        summary = await db.get_user_summary(guild_id, str(member.id), start, end)
+        embed.add_field(name="Net Worked", value=fmt_duration(summary["total_minutes"]), inline=True)
+    embed.set_footer(text="CSV now includes status, break minutes, and net worked time")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -89,14 +106,17 @@ async def report_summary(interaction: discord.Interaction, period: str = "week")
 
     start, end = exporter.get_period_dates(period)
     guild_id = str(interaction.guild_id)
+    entries = await db.get_all_entries_range(guild_id, start, end)
+    if not entries:
+        await interaction.followup.send("📭 No time data found for that period.", ephemeral=True)
+        return
 
     path = await exporter.export_summary(guild_id, period, start, end)
-
-    entries = await db.get_all_entries_range(guild_id, start, end)
     user_count = len(set(e["user_id"] for e in entries))
     total_mins = 0
     for uid in set(e["user_id"] for e in entries):
         total_mins += (await db.get_user_summary(guild_id, uid, start, end))["total_minutes"]
+    average_minutes = int(total_mins / user_count) if user_count else 0
 
     embed = discord.Embed(
         title="📈 Summary Report",
@@ -105,8 +125,9 @@ async def report_summary(interaction: discord.Interaction, period: str = "week")
         timestamp=datetime.utcnow()
     )
     embed.add_field(name="Employees", value=str(user_count), inline=True)
-    embed.add_field(name="Total Hours", value=fmt_duration(total_mins), inline=True)
-    embed.set_footer(text="Includes overtime breakdown per employee")
+    embed.add_field(name="Net Hours", value=fmt_duration(total_mins), inline=True)
+    embed.add_field(name="Average / Employee", value=fmt_duration(average_minutes), inline=True)
+    embed.set_footer(text="CSV includes gross time, break time, overtime, and balance columns")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -187,8 +208,14 @@ async def report_leave(interaction: discord.Interaction, status: str = "all"):
     await interaction.response.defer(ephemeral=True)
 
     filter_status = None if status == "all" else status
-    path = await exporter.export_leave(str(interaction.guild_id), filter_status)
     requests = await db.get_leave_requests(str(interaction.guild_id), status=filter_status)
+    if not requests:
+        await interaction.followup.send("📭 No leave records found for that filter.", ephemeral=True)
+        return
+    path = await exporter.export_leave(str(interaction.guild_id), filter_status)
+    approved_count = sum(1 for request in requests if request["status"] == "approved")
+    pending_count = sum(1 for request in requests if request["status"] == "pending")
+    denied_count = sum(1 for request in requests if request["status"] == "denied")
 
     embed = discord.Embed(
         title="📋 Leave Requests Export",
@@ -197,6 +224,10 @@ async def report_leave(interaction: discord.Interaction, status: str = "all"):
     )
     embed.add_field(name="Records", value=str(len(requests)), inline=True)
     embed.add_field(name="Filter", value=status.upper(), inline=True)
+    embed.add_field(name="Approved", value=str(approved_count), inline=True)
+    embed.add_field(name="Pending", value=str(pending_count), inline=True)
+    embed.add_field(name="Denied", value=str(denied_count), inline=True)
+    embed.set_footer(text="CSV includes leave duration in days")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -250,6 +281,7 @@ async def report_updates(
     embed.add_field(name="Entries", value=str(len(rows)), inline=True)
     embed.add_field(name="Employees", value=str(distinct_users), inline=True)
     embed.add_field(name="Filter", value=member.mention if member else "All employees", inline=True)
+    embed.set_footer(text="CSV includes parsed current work, next work, and blockers columns")
 
     await interaction.followup.send(embed=embed, file=discord.File(path), ephemeral=True)
 

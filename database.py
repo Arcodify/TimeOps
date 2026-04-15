@@ -580,6 +580,19 @@ class Database:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_users_on_approved_leave(self, guild_id: str, on_date: str) -> set[str]:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM leave_requests
+                WHERE guild_id=? AND status='approved' AND start_date <= ? AND end_date >= ?
+                """,
+                (guild_id, on_date, on_date),
+            ) as cur:
+                rows = await cur.fetchall()
+        return {str(row[0]) for row in rows}
+
     async def get_pending_leave_requests_with_messages(self) -> List[Dict]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -746,6 +759,15 @@ class Database:
                 rows = await cur.fetchall()
 
         return sum(int(row[1] or 0) for row in rows)
+
+    async def get_users_with_active_breaks(self, guild_id: str) -> set[str]:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT DISTINCT user_id FROM break_entries WHERE guild_id=? AND break_end IS NULL",
+                (guild_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return {str(row[0]) for row in rows}
 
     async def get_work_rules(self, guild_id: str) -> Dict:
         async with aiosqlite.connect(self.path) as db:
@@ -920,6 +942,26 @@ class Database:
             ) as cur:
                 rows = await cur.fetchall()
         return [dict(row) for row in rows]
+
+    async def clear_pending_work_updates(
+        self,
+        guild_id: str,
+        user_id: str = None,
+        time_entry_id: int = None,
+    ) -> int:
+        query = "DELETE FROM work_updates WHERE guild_id=? AND submitted_at IS NULL"
+        params = [guild_id]
+        if user_id is not None:
+            query += " AND user_id=?"
+            params.append(user_id)
+        if time_entry_id is not None:
+            query += " AND time_entry_id=?"
+            params.append(time_entry_id)
+
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(query, params)
+            await db.commit()
+        return cursor.rowcount or 0
 
     async def ensure_work_update_prompt(
         self,

@@ -6,6 +6,7 @@ Exports to exports/ directory with timestamps
 import csv
 import os
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict
 
@@ -19,6 +20,11 @@ def fmt_duration(minutes: int) -> str:
     h = minutes // 60
     m = minutes % 60
     return f"{h}h {m:02d}m"
+
+
+def _safe_label(value: str) -> str:
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip())
+    return label.strip("_") or "report"
 
 
 def _split_work_update_content(content: str) -> tuple[str, str, str]:
@@ -56,30 +62,56 @@ class CSVExporter:
         log.info(f"Exported {len(rows)} rows → {path}")
         return path
 
-    async def export_timesheet(self, guild_id: str, period: str, 
-                                start: datetime, end: datetime) -> str:
+    async def export_timesheet(
+        self,
+        guild_id: str,
+        period: str,
+        start: datetime,
+        end: datetime,
+        user_id: str = None,
+    ) -> str:
         """Export detailed time entries for a period."""
-        entries = await self.db.get_all_entries_range(guild_id, start, end)
+        if user_id:
+            entries = await self.db.get_entries_range(guild_id, user_id, start, end)
+        else:
+            entries = await self.db.get_all_entries_range(guild_id, start, end)
         
         rows = []
         for e in entries:
+            actual_break_minutes = await self.db.get_break_minutes_for_entry(e["id"])
+            applied_break_minutes = (
+                await self.db.get_applied_break_minutes_for_entry(guild_id, e["id"])
+                if e["clock_out"]
+                else actual_break_minutes
+            )
+            gross_minutes = e["duration_minutes"]
+            net_minutes = (
+                max(0, gross_minutes - applied_break_minutes)
+                if gross_minutes is not None
+                else None
+            )
             rows.append({
                 "Date": e["clock_in"][:10],
                 "Employee": e["username"],
                 "User ID": e["user_id"],
                 "Clock In": e["clock_in"].replace("T", " ")[:19],
                 "Clock Out": (e["clock_out"] or "").replace("T", " ")[:19] or "In Progress",
-                "Duration": fmt_duration(e["duration_minutes"]),
-                "Duration (mins)": e["duration_minutes"] or "",
+                "Status": "In Progress" if not e["clock_out"] else ("Auto Clock-Out" if e["auto_out"] else "Completed"),
+                "Gross Duration": fmt_duration(gross_minutes),
+                "Gross Minutes": gross_minutes if gross_minutes is not None else "",
+                "Break Minutes": applied_break_minutes if e["clock_out"] else actual_break_minutes,
+                "Net Duration": fmt_duration(net_minutes),
+                "Net Minutes": net_minutes if net_minutes is not None else "",
                 "Auto Clock-Out": "Yes" if e["auto_out"] else "No",
                 "Note": e["note"] or ""
             })
         
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"timesheet_{period}_{start.strftime('%Y%m%d')}_{ts}.csv"
+        filename = f"timesheet_{_safe_label(period)}_{start.strftime('%Y%m%d')}_{ts}.csv"
         return self._write_csv(filename, rows, [
             "Date", "Employee", "User ID", "Clock In", "Clock Out",
-            "Duration", "Duration (mins)", "Auto Clock-Out", "Note"
+            "Status", "Gross Duration", "Gross Minutes", "Break Minutes",
+            "Net Duration", "Net Minutes", "Auto Clock-Out", "Note"
         ])
 
     async def export_summary(self, guild_id: str, period: str,
@@ -106,16 +138,26 @@ class CSVExporter:
             total_mins = summary["total_minutes"]
             expected_mins = config["daily_hours"] * 60 * days if (config.get("mode") or "overtime") == "overtime" else 0
             overtime_mins = max(0, total_mins - expected_mins) if expected_mins > 0 else 0
+            balance_minutes = int(total_mins - expected_mins) if expected_mins > 0 else 0
             
             rows.append({
                 "Employee": u["username"],
                 "User ID": uid,
                 "Days Worked": days,
+                "Gross Hours": fmt_duration(summary["gross_minutes"]),
+                "Gross Minutes": summary["gross_minutes"],
+                "Break Duration": fmt_duration(summary["break_minutes"]),
                 "Total Hours": fmt_duration(total_mins),
                 "Total Minutes": total_mins,
                 "Expected Hours": fmt_duration(int(expected_mins)),
                 "Overtime": fmt_duration(overtime_mins),
                 "Overtime Minutes": overtime_mins,
+                "Balance": (
+                    f"+{fmt_duration(balance_minutes)}"
+                    if balance_minutes > 0
+                    else (f"-{fmt_duration(abs(balance_minutes))}" if balance_minutes < 0 else "0h 00m")
+                ),
+                "Balance Minutes": balance_minutes,
                 "Sessions": u["entry_count"],
                 "Break Minutes": summary["break_minutes"]
             })
@@ -123,10 +165,12 @@ class CSVExporter:
         rows.sort(key=lambda x: x["Employee"].lower())
         
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"summary_{period}_{start.strftime('%Y%m%d')}_{ts}.csv"
+        filename = f"summary_{_safe_label(period)}_{start.strftime('%Y%m%d')}_{ts}.csv"
         return self._write_csv(filename, rows, [
-            "Employee", "User ID", "Days Worked", "Total Hours", "Total Minutes",
-            "Expected Hours", "Overtime", "Overtime Minutes", "Sessions", "Break Minutes"
+            "Employee", "User ID", "Days Worked", "Gross Hours", "Gross Minutes",
+            "Break Duration", "Break Minutes", "Total Hours", "Total Minutes",
+            "Expected Hours", "Overtime", "Overtime Minutes", "Balance",
+            "Balance Minutes", "Sessions"
         ])
 
     async def export_leave(self, guild_id: str, status: str = None) -> str:
@@ -140,6 +184,9 @@ class CSVExporter:
             "Leave Type": r["leave_type"],
             "Start Date": r["start_date"],
             "End Date": r["end_date"],
+            "Duration Days": (
+                (datetime.fromisoformat(r["end_date"]) - datetime.fromisoformat(r["start_date"])).days + 1
+            ),
             "Reason": r["reason"] or "",
             "Status": r["status"].upper(),
             "Approver": r["approver_name"] or "",
@@ -151,7 +198,7 @@ class CSVExporter:
         filename = f"leave_requests{label}_{ts}.csv"
         return self._write_csv(filename, rows, [
             "ID", "Employee", "User ID", "Leave Type", "Start Date", "End Date",
-            "Reason", "Status", "Approver", "Submitted At"
+            "Duration Days", "Reason", "Status", "Approver", "Submitted At"
         ])
 
     async def export_work_updates(
@@ -185,7 +232,7 @@ class CSVExporter:
             })
 
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"work_updates_{label}_{period}_{start.strftime('%Y%m%d')}_{ts}.csv"
+        filename = f"work_updates_{_safe_label(label)}_{_safe_label(period)}_{start.strftime('%Y%m%d')}_{ts}.csv"
         return self._write_csv(filename, rows, [
             "Date",
             "Employee",

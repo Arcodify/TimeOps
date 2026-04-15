@@ -89,6 +89,14 @@ async def _get_guild_timezone(bot, guild_id: str) -> tuple[ZoneInfo, str]:
         return ZoneInfo("UTC"), "UTC"
 
 
+async def _get_unavailable_user_ids(bot, guild_id: str) -> tuple[set[str], set[str]]:
+    tz, _ = await _get_guild_timezone(bot, guild_id)
+    local_date = datetime.now(tz).date().isoformat()
+    on_leave_user_ids = await bot.db.get_users_on_approved_leave(guild_id, local_date)
+    on_break_user_ids = await bot.db.get_users_with_active_breaks(guild_id)
+    return on_leave_user_ids, on_break_user_ids
+
+
 async def _build_due_prompt_slot(bot, guild_id: str, active_entry: dict, config: dict) -> int:
     overtime_config = await bot.db.get_overtime_config(guild_id)
     mode = (overtime_config.get("mode") or "overtime").strip().lower()
@@ -412,7 +420,12 @@ class Updates(commands.Cog):
                 continue
 
             active_entries = await self.bot.db.get_active_entries_for_guild(guild_id)
+            on_leave_user_ids, on_break_user_ids = await _get_unavailable_user_ids(
+                self.bot, guild_id
+            )
             for row in active_entries:
+                if row["user_id"] in on_leave_user_ids or row["user_id"] in on_break_user_ids:
+                    continue
                 prompt_slot = await _build_due_prompt_slot(self.bot, guild_id, row, config)
                 if prompt_slot < 1:
                     continue
@@ -449,7 +462,9 @@ async def update_config(
         )
         return
 
-    work_mode = (await interaction.client.db.get_overtime_config(str(interaction.guild_id))).get("mode") or "overtime"
+    guild_id = str(interaction.guild_id)
+    current_config = await interaction.client.db.get_work_update_config(guild_id)
+    work_mode = (await interaction.client.db.get_overtime_config(guild_id)).get("mode") or "overtime"
     parsed_update_times: list[str] = []
     if update_times is not None:
         try:
@@ -461,7 +476,6 @@ async def update_config(
             )
             return
     else:
-        current_config = await interaction.client.db.get_work_update_config(str(interaction.guild_id))
         try:
             parsed_update_times = _parse_update_times(current_config.get("update_times"))
         except ValueError:
@@ -499,14 +513,25 @@ async def update_config(
             )
             return
 
+    serialized_update_times = ",".join(parsed_update_times) if parsed_update_times else None
+
     await interaction.client.db.set_work_update_config(
-        str(interaction.guild_id),
+        guild_id,
         enabled=enabled,
         interval_hours=interval_hours,
-        update_times=",".join(parsed_update_times) if parsed_update_times else None,
+        update_times=serialized_update_times,
         question_text=question.strip(),
         archive_channel_id=str(archive_obj.id) if archive_obj else None,
     )
+    cleared_pending_prompts = 0
+    previous_enabled = bool(current_config.get("enabled"))
+    if work_mode == "time_shift":
+        schedule_changed = (current_config.get("update_times") or "") != (serialized_update_times or "")
+    else:
+        previous_interval = float(current_config.get("interval_hours") or 0)
+        schedule_changed = abs(previous_interval - interval_hours) > 1e-9
+    if (previous_enabled != enabled) or schedule_changed:
+        cleared_pending_prompts = await interaction.client.db.clear_pending_work_updates(guild_id)
 
     embed = discord.Embed(title="📝 Work Update Prompts", color=0x57F287)
     embed.add_field(
@@ -530,6 +555,12 @@ async def update_config(
         inline=True,
     )
     embed.add_field(name="Instruction", value=question.strip(), inline=False)
+    if cleared_pending_prompts:
+        embed.add_field(
+            name="Pending Prompts",
+            value=f"Cleared `{cleared_pending_prompts}` stale prompt(s) from the old schedule.",
+            inline=False,
+        )
     embed.add_field(
         name="Form Fields",
         value=(

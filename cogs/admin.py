@@ -368,6 +368,7 @@ async def overtime_config(
     guild_id = str(interaction.guild_id)
     current_config = await db.get_overtime_config(guild_id)
     current_rules = await db.get_work_rules(guild_id)
+    previous_mode = (current_config.get("mode") or "overtime").strip().lower()
 
     selected_mode = (mode or current_config.get("mode") or "overtime").strip().lower()
     if selected_mode not in {"overtime", "time_shift"}:
@@ -440,6 +441,9 @@ async def overtime_config(
         default_break_minutes=default_break_minutes,
         blocked_weekdays=blocked_weekdays
     )
+    cleared_pending_prompts = 0
+    if previous_mode != selected_mode:
+        cleared_pending_prompts = await db.clear_pending_work_updates(guild_id)
 
     embed = discord.Embed(title="⚙️ Time Config Updated", color=0x57F287)
     embed.add_field(name="Mode", value=f"`{_mode_label(selected_mode)}`", inline=True)
@@ -454,6 +458,12 @@ async def overtime_config(
             name="Auto Clock-Out",
             value=f"`{auto_out_hours}h`" if auto_out_hours > 0 else "Disabled",
             inline=True
+        )
+    if cleared_pending_prompts:
+        embed.add_field(
+            name="Pending Work Updates",
+            value=f"Cleared `{cleared_pending_prompts}` stale prompt(s) from the previous mode.",
+            inline=False,
         )
     embed.add_field(name="Default Break", value=f"`{default_break_minutes} min`", inline=True)
     embed.add_field(name="Blocked Clock-In Days", value=_weekday_labels(blocked_weekdays), inline=True)

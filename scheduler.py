@@ -113,6 +113,37 @@ class StandupScheduler:
         }
         return voice_channel
 
+    async def _get_eligible_standup_members(
+        self, guild: discord.Guild, standup: dict
+    ) -> list[discord.Member]:
+        guild_id = str(standup["guild_id"])
+        tz, _ = await self._get_standup_timezone(guild_id)
+        local_date = datetime.now(tz).date().isoformat()
+        active_entries = await self.db.get_active_entries_for_guild(guild_id)
+        if not active_entries:
+            return []
+
+        on_leave_user_ids = await self.db.get_users_on_approved_leave(guild_id, local_date)
+        on_break_user_ids = await self.db.get_users_with_active_breaks(guild_id)
+
+        members: list[discord.Member] = []
+        seen_user_ids: set[str] = set()
+        for row in active_entries:
+            user_id = str(row["user_id"])
+            if user_id in seen_user_ids or user_id in on_leave_user_ids or user_id in on_break_user_ids:
+                continue
+            seen_user_ids.add(user_id)
+
+            member = guild.get_member(int(user_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except Exception:
+                    member = None
+            if member is not None:
+                members.append(member)
+        return members
+
     async def _send_standup(self, standup: dict, *, update_last_sent: bool = True):
         try:
             channel = self.bot.get_channel(int(standup["channel_id"]))
@@ -120,6 +151,22 @@ class StandupScheduler:
                 channel = await self.bot.fetch_channel(int(standup["channel_id"]))
             if not channel:
                 log.warning(f"Standup channel {standup['channel_id']} not found")
+                return
+
+            guild = getattr(channel, "guild", None)
+            if guild is None:
+                log.warning("Standup channel %s is not attached to a guild", standup["channel_id"])
+                return
+
+            eligible_members = await self._get_eligible_standup_members(guild, standup)
+            if not eligible_members:
+                if update_last_sent:
+                    await self.db.update_standup_last_sent(standup["id"], datetime.utcnow().isoformat())
+                log.info(
+                    "Skipped standup '%s' in guild %s because nobody is currently eligible",
+                    standup["name"],
+                    standup["guild_id"],
+                )
                 return
 
             voice_channel = await self._create_temp_voice_channel(standup, channel)
@@ -148,6 +195,11 @@ class StandupScheduler:
                 inline=False,
             )
             embed.add_field(
+                name="Recipients",
+                value=f"`{len(eligible_members)}` present member(s) are being notified.",
+                inline=False,
+            )
+            embed.add_field(
                 name="Standup Form",
                 value=(
                     f"1. {standup.get('form_title_1') or DEFAULT_FORM_TITLE_1}\n"
@@ -160,9 +212,9 @@ class StandupScheduler:
             _, timezone_name = await self._get_standup_timezone(str(standup["guild_id"]))
             embed.set_footer(text=f"HR Bot • Standup • {timezone_name}")
 
-            content = ""
-            if standup.get("ping_role"):
-                content = f"<@&{standup['ping_role']}>"
+            content = " ".join(member.mention for member in eligible_members)
+            if len(content) > 1900:
+                content = " ".join(member.mention for member in eligible_members[:50])
 
             view = build_standup_submission_view(self.bot, standup, occurrence_key)
             await channel.send(content=content or None, embed=embed, view=view)
