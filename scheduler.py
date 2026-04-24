@@ -144,6 +144,23 @@ class StandupScheduler:
                 members.append(member)
         return members
 
+    async def _get_present_ping_role(
+        self,
+        guild: discord.Guild,
+        standup: dict,
+    ) -> discord.Role | None:
+        config = await self.db.get_guild_config(str(guild.id))
+        present_role_id = config.get("present_role_id")
+        if present_role_id:
+            role = guild.get_role(int(present_role_id))
+            if role is not None:
+                return role
+
+        ping_role_id = standup.get("ping_role")
+        if ping_role_id:
+            return guild.get_role(int(ping_role_id))
+        return None
+
     async def _send_standup(self, standup: dict, *, update_last_sent: bool = True):
         try:
             channel = self.bot.get_channel(int(standup["channel_id"]))
@@ -173,6 +190,7 @@ class StandupScheduler:
             voice_duration_minutes = int(standup.get("voice_duration_minutes") or 20)
             description = standup["message"] or "Standup is live. Join the meeting below."
             occurrence_key = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            ping_role = await self._get_present_ping_role(guild, standup)
             from cogs.standup import (
                 DEFAULT_FORM_TITLE_1,
                 DEFAULT_FORM_TITLE_2,
@@ -196,7 +214,10 @@ class StandupScheduler:
             )
             embed.add_field(
                 name="Recipients",
-                value=f"`{len(eligible_members)}` present member(s) are being notified.",
+                value=(
+                    f"`{len(eligible_members)}` present member(s) are eligible.\n"
+                    f"Ping: {ping_role.mention if ping_role is not None else 'No role ping configured'}"
+                ),
                 inline=False,
             )
             embed.add_field(
@@ -212,12 +233,13 @@ class StandupScheduler:
             _, timezone_name = await self._get_standup_timezone(str(standup["guild_id"]))
             embed.set_footer(text=f"HR Bot • Standup • {timezone_name}")
 
-            content = " ".join(member.mention for member in eligible_members)
-            if len(content) > 1900:
-                content = " ".join(member.mention for member in eligible_members[:50])
-
             view = build_standup_submission_view(self.bot, standup, occurrence_key)
-            await channel.send(content=content or None, embed=embed, view=view)
+            await channel.send(
+                content=ping_role.mention if ping_role is not None else None,
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
             if update_last_sent:
                 await self.db.update_standup_last_sent(standup["id"], datetime.utcnow().isoformat())
             log.info(

@@ -12,6 +12,9 @@ from discord.ext.tasks import loop
 import aiosqlite
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from database import parse_blocked_weekdays, parse_hhmm
 
 log = logging.getLogger("Reminders")
 
@@ -46,6 +49,7 @@ class Reminders(commands.Cog):
         for config in configs:
             if config["reminder_time"] == now_str:
                 await _send_reminders(self.bot, config["guild_id"], config.get("channel_id"))
+        await _send_shift_start_reminders(self.bot)
 
 
 async def _get_config(db_path: str, guild_id: str):
@@ -114,6 +118,76 @@ async def _send_reminders(bot, guild_id: str, channel_id: str = None):
             pass
 
     log.info(f"EOD reminders sent to {reminded} users in guild {guild_id}")
+
+
+async def _get_guild_timezone(bot, guild_id: str) -> tuple[ZoneInfo, str]:
+    config = await bot.db.get_guild_config(guild_id)
+    timezone_name = config.get("timezone") or "UTC"
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except Exception:
+        return ZoneInfo("UTC"), "UTC"
+
+
+async def _send_shift_start_reminders(bot):
+    for guild in bot.guilds:
+        guild_id = str(guild.id)
+        overtime_config = await bot.db.get_overtime_config(guild_id)
+        if (overtime_config.get("mode") or "overtime") != "time_shift":
+            continue
+
+        shift_clock_in_time = (overtime_config.get("shift_clock_in_time") or "").strip()
+        if not shift_clock_in_time:
+            continue
+
+        tz, timezone_name = await _get_guild_timezone(bot, guild_id)
+        local_now = datetime.now(tz)
+        if local_now.strftime("%H:%M") != shift_clock_in_time:
+            continue
+
+        work_rules = await bot.db.get_work_rules(guild_id)
+        if local_now.weekday() in parse_blocked_weekdays(work_rules.get("blocked_weekdays")):
+            continue
+
+        local_date = local_now.date().isoformat()
+        reminder_key = f"shift_start:{local_date}:{shift_clock_in_time}"
+        on_leave_user_ids = await bot.db.get_users_on_approved_leave(guild_id, local_date)
+        active_entries = await bot.db.get_active_entries_for_guild(guild_id)
+        already_clocked_in = {str(entry["user_id"]) for entry in active_entries}
+        known_user_ids = await bot.db.get_known_user_ids_for_guild(guild_id)
+        shift_start_local = local_now.replace(
+            hour=parse_hhmm(shift_clock_in_time).hour,
+            minute=parse_hhmm(shift_clock_in_time).minute,
+            second=0,
+            microsecond=0,
+        )
+
+        for user_id in known_user_ids:
+            if user_id in on_leave_user_ids or user_id in already_clocked_in:
+                continue
+
+            member = guild.get_member(int(user_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except Exception:
+                    member = None
+            if member is None or member.bot:
+                continue
+
+            first_send = await bot.db.record_reminder_dispatch(guild_id, user_id, reminder_key)
+            if not first_send:
+                continue
+
+            try:
+                await member.send(
+                    "⏰ **Shift Start Reminder**\n"
+                    f"It's time to clock in for your shift.\n"
+                    f"Scheduled clock-in time: `{shift_start_local.strftime('%Y-%m-%d %H:%M')} {timezone_name}`.\n"
+                    "If you're starting now, use `/clockin`."
+                )
+            except Exception:
+                pass
 
 
 @reminder_group.command(name="set", description="Configure end-of-day clock-out reminder")

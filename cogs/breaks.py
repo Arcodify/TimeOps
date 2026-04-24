@@ -10,7 +10,7 @@ from discord.ext import commands
 from discord.ext.tasks import loop
 from discord import app_commands
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from cogs.activity_log import post_activity_log
 
@@ -61,6 +61,22 @@ async def _get_current_scheduled_break(bot, guild: discord.Guild):
     return None
 
 
+async def _get_named_scheduled_break(bot, guild: discord.Guild, schedule_name: str):
+    schedules = await bot.db.get_scheduled_breaks(str(guild.id))
+    for schedule in schedules:
+        if schedule["name"] == schedule_name:
+            return schedule
+    return None
+
+
+def _schedule_window_for_now(schedule: dict, local_now: datetime) -> tuple[datetime, datetime]:
+    start = _parse_hhmm(schedule["start_time"])
+    end = _parse_hhmm(schedule["end_time"])
+    start_local = local_now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+    end_local = local_now.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    return start_local, end_local
+
+
 async def _notify_break_message(
     bot,
     guild: discord.Guild,
@@ -85,6 +101,17 @@ async def _notify_break_message(
         await member.send(embed=embed)
     except Exception:
         pass
+
+
+async def _mark_break_reminder_sent(db_path: str, break_id: int):
+    import aiosqlite
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE break_entries SET reminder_sent_at=? WHERE id=?",
+            (datetime.utcnow().isoformat(), break_id),
+        )
+        await db.commit()
 
 
 class Breaks(commands.Cog):
@@ -126,6 +153,8 @@ class Breaks(commands.Cog):
         for guild in self.bot.guilds:
             current_schedule = await _get_current_scheduled_break(self.bot, guild)
             active_entries = await self.bot.db.get_active_entries_for_guild(str(guild.id))
+            tz, _ = await _get_guild_timezone(self.bot, str(guild.id))
+            local_now = datetime.now(tz)
 
             for entry in active_entries:
                 member = guild.get_member(int(entry["user_id"]))
@@ -139,36 +168,24 @@ class Breaks(commands.Cog):
 
                 if active_break and active_break.get("break_type") == "scheduled":
                     active_name = active_break.get("reason") or ""
-                    if current_schedule is None or active_name != current_schedule["name"]:
-                        result = await _end_break(self.bot.db.path, str(guild.id), entry["user_id"])
-                        if member is not None:
-                            try:
-                                await _clear_on_break_role(self.bot, guild, member)
-                            except Exception:
-                                pass
-                        if result:
-                            await post_activity_log(
-                                self.bot,
-                                str(guild.id),
-                                title="✅ Automatic Break Ended",
-                                color=0x57F287,
-                                fields=[
-                                    ("Employee", entry["username"], True),
-                                    ("Break", _label_break(result), True),
-                                    ("Duration", f"`{fmt_duration(result['duration_minutes'])}`", True),
-                                ],
-                            )
+                    schedule = await _get_named_scheduled_break(self.bot, guild, active_name)
+                    if schedule is not None and not active_break.get("reminder_sent_at"):
+                        _, end_local = _schedule_window_for_now(schedule, local_now)
+                        reminder_local = end_local - timedelta(minutes=1)
+                        if reminder_local <= local_now < end_local:
                             await _notify_break_message(
                                 self.bot,
                                 guild,
                                 entry["user_id"],
-                                title="✅ This break ended",
+                                title="⏰ Break ends in 1 minute",
                                 description=(
-                                    f"Your scheduled break **{_label_break(result)}** has ended.\n"
-                                    "You're back on the clock."
+                                    f"Your scheduled break **{schedule['name']}** ends at "
+                                    f"`{schedule['end_time']}`.\n"
+                                    "Please end break manually when you're back."
                                 ),
-                                color=0x57F287,
+                                color=0x5865F2,
                             )
+                            await _mark_break_reminder_sent(self.bot.db.path, active_break["id"])
                     continue
 
                 if active_break:
@@ -316,17 +333,20 @@ async def _get_active_auto_break_message(bot, guild: discord.Guild, active_break
     if guild is None or not active_break or active_break.get("break_type") != "scheduled":
         return None
 
-    schedule = await _get_current_scheduled_break(bot, guild)
+    schedule = await _get_named_scheduled_break(bot, guild, active_break.get("reason") or "")
     if schedule is None:
         return None
 
-    if (active_break.get("reason") or "") != schedule["name"]:
+    tz, timezone_name = await _get_guild_timezone(bot, str(guild.id))
+    local_now = datetime.now(tz)
+    _, end_local = _schedule_window_for_now(schedule, local_now)
+    manual_end_from = end_local - timedelta(minutes=1)
+    if local_now >= manual_end_from:
         return None
 
-    _, timezone_name = await _get_guild_timezone(bot, str(guild.id))
     return (
         "⚠️ This is a scheduled company break window.\n"
-        f"It will end at `{schedule['end_time']}` ({timezone_name})."
+        f"You can end it manually from `{manual_end_from.strftime('%H:%M')}` ({timezone_name})."
     )
 
 

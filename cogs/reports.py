@@ -89,7 +89,7 @@ async def report_timesheet(
     if member:
         summary = await db.get_user_summary(guild_id, str(member.id), start, end)
         embed.add_field(name="Net Worked", value=fmt_duration(summary["total_minutes"]), inline=True)
-    embed.set_footer(text="CSV now includes status, break minutes, and net worked time")
+    embed.set_footer(text="CSV includes note rows above the header plus status, break minutes, net worked time, and early clock-out fields")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -127,7 +127,7 @@ async def report_summary(interaction: discord.Interaction, period: str = "week")
     embed.add_field(name="Employees", value=str(user_count), inline=True)
     embed.add_field(name="Net Hours", value=fmt_duration(total_mins), inline=True)
     embed.add_field(name="Average / Employee", value=fmt_duration(average_minutes), inline=True)
-    embed.set_footer(text="CSV includes gross time, break time, overtime, and balance columns")
+    embed.set_footer(text="CSV includes note rows above the header plus gross time, break time, overtime, and balance columns")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -227,7 +227,7 @@ async def report_leave(interaction: discord.Interaction, status: str = "all"):
     embed.add_field(name="Approved", value=str(approved_count), inline=True)
     embed.add_field(name="Pending", value=str(pending_count), inline=True)
     embed.add_field(name="Denied", value=str(denied_count), inline=True)
-    embed.set_footer(text="CSV includes leave duration in days")
+    embed.set_footer(text="CSV includes note rows above the header plus leave duration in days")
 
     file = discord.File(path)
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
@@ -281,7 +281,7 @@ async def report_updates(
     embed.add_field(name="Entries", value=str(len(rows)), inline=True)
     embed.add_field(name="Employees", value=str(distinct_users), inline=True)
     embed.add_field(name="Filter", value=member.mention if member else "All employees", inline=True)
-    embed.set_footer(text="CSV includes parsed current work, next work, and blockers columns")
+    embed.set_footer(text="CSV includes note rows above the header plus parsed current work, next work, and blockers columns")
 
     await interaction.followup.send(embed=embed, file=discord.File(path), ephemeral=True)
 

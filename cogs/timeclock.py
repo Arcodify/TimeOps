@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import Database, parse_blocked_weekdays, parse_hhmm
 from cogs.activity_log import post_activity_log
@@ -97,14 +97,18 @@ async def _can_clock_in(db: Database, guild_id: str) -> tuple[bool, str | None]:
 
 
 async def _can_clock_out(db: Database, guild_id: str) -> tuple[bool, str | None]:
+    return True, None
+
+
+async def _get_shift_clock_out_context(db: Database, guild_id: str) -> dict | None:
     guild_config = await db.get_guild_config(guild_id)
     config = await db.get_overtime_config(guild_id)
     if (config.get("mode") or "overtime") != "time_shift":
-        return True, None
+        return None
 
-    shift_clock_out_time = (config.get("shift_clock_out_time") or "").strip()
-    if not shift_clock_out_time:
-        return True, None
+    scheduled_clock_out_time = (config.get("default_clock_out_time") or "").strip()
+    if not scheduled_clock_out_time:
+        return None
 
     timezone_name = guild_config.get("timezone") or "UTC"
     try:
@@ -114,14 +118,186 @@ async def _can_clock_out(db: Database, guild_id: str) -> tuple[bool, str | None]
         timezone_name = "UTC"
 
     local_now = datetime.now(tz)
-    end_time = parse_hhmm(shift_clock_out_time)
-    if local_now.time() < end_time:
-        return False, (
-            f"⚠️ Clock out is available from `{shift_clock_out_time}` in `{timezone_name}` "
-            "for the current time-shift setup."
+    scheduled_local = local_now.replace(
+        hour=parse_hhmm(scheduled_clock_out_time).hour,
+        minute=parse_hhmm(scheduled_clock_out_time).minute,
+        second=0,
+        microsecond=0,
+    )
+    early_cutoff_local = scheduled_local - timedelta(minutes=5)
+    return {
+        "timezone_name": timezone_name,
+        "scheduled_clock_out_time": scheduled_clock_out_time,
+        "scheduled_local": scheduled_local,
+        "actual_local": local_now,
+        "is_early": local_now < early_cutoff_local,
+    }
+
+
+def _format_local_dt(value: datetime, timezone_name: str) -> str:
+    return value.strftime(f"%Y-%m-%d %H:%M {timezone_name}")
+
+
+async def _perform_clock_out(
+    interaction: discord.Interaction,
+    db: Database,
+    *,
+    early_clock_out_reason: str = None,
+    force_early_clock_out: bool = False,
+):
+    clock_out_context = await _get_shift_clock_out_context(db, str(interaction.guild_id))
+    is_early_clock_out = bool(
+        early_clock_out_reason
+        and (
+            force_early_clock_out
+            or (clock_out_context is not None and clock_out_context["is_early"])
+        )
+    )
+
+    result = await db.clock_out(
+        str(interaction.guild_id),
+        str(interaction.user.id),
+        early_clock_out=is_early_clock_out,
+        early_clock_out_reason=early_clock_out_reason,
+        scheduled_clock_out_time=(
+            clock_out_context["scheduled_clock_out_time"]
+            if clock_out_context is not None
+            else None
+        ),
+    )
+    if not result["success"]:
+        await interaction.response.send_message(
+            "⚠️ You're not currently clocked in.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        if isinstance(interaction.user, discord.Member):
+            await _clear_present_role(interaction.client, interaction.guild, interaction.user)
+            await _clear_on_break_role(interaction.client, interaction.guild, interaction.user)
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
+
+    break_minutes = await db.get_applied_break_minutes_for_entry(
+        str(interaction.guild_id),
+        result["entry_id"],
+    )
+    config = await db.get_overtime_config(str(interaction.guild_id))
+    net_minutes = max(0, result["duration_minutes"] - break_minutes)
+    overtime = 0
+    if (config.get("mode") or "overtime") == "overtime":
+        daily_mins = config["daily_hours"] * 60
+        overtime = max(0, net_minutes - daily_mins)
+
+    embed = discord.Embed(title="🔴 Clocked Out", color=0xED4245, timestamp=datetime.utcnow())
+    embed.add_field(name="Gross Duration", value=f"`{fmt_duration(result['duration_minutes'])}`", inline=True)
+    embed.add_field(name="Break Time", value=f"`{fmt_duration(break_minutes)}`", inline=True)
+    embed.add_field(name="Net Duration", value=f"**{fmt_duration(net_minutes)}**", inline=True)
+    embed.add_field(name="Clock In", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`", inline=True)
+    embed.add_field(name="Clock Out", value=f"`{result['clock_out'].replace('T',' ')[:16]} UTC`", inline=True)
+    if clock_out_context is not None:
+        actual_local = datetime.fromisoformat(result["clock_out"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(
+            ZoneInfo(clock_out_context["timezone_name"])
+        )
+        embed.add_field(
+            name="Actual Clock-Out Time",
+            value=f"`{_format_local_dt(actual_local, clock_out_context['timezone_name'])}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Scheduled Clock-Out Time",
+            value=f"`{_format_local_dt(clock_out_context['scheduled_local'], clock_out_context['timezone_name'])}`",
+            inline=False,
+        )
+    if is_early_clock_out and early_clock_out_reason:
+        embed.add_field(name="Early Clock-Out Reason", value=early_clock_out_reason[:1024], inline=False)
+    if overtime > 0:
+        embed.add_field(name="⚡ Overtime This Session", value=fmt_duration(int(overtime)), inline=True)
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    await post_activity_log(
+        interaction.client,
+        str(interaction.guild_id),
+        title="🔴 Clocked Out",
+        color=0xED4245,
+        fields=[
+            ("Employee", interaction.user.mention, True),
+            ("Clock In", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
+            ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
+            ("Net Duration", f"`{fmt_duration(net_minutes)}`", True),
+            ("Break Time", f"`{fmt_duration(break_minutes)}`", True),
+            (
+                "Scheduled Clock-Out",
+                (
+                    f"`{_format_local_dt(clock_out_context['scheduled_local'], clock_out_context['timezone_name'])}`"
+                    if clock_out_context is not None
+                    else "—"
+                ),
+                False,
+            ),
+            ("Early Clock-Out Reason", early_clock_out_reason or "—", False),
+        ],
+        thumbnail_url=interaction.user.display_avatar.url,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class EarlyClockOutModal(discord.ui.Modal):
+    def __init__(self, db: Database, clock_out_context: dict):
+        super().__init__(title="Confirm Early Clock-Out")
+        self.db = db
+        self.clock_out_context = clock_out_context
+        self.reason = discord.ui.TextInput(
+            label="Reason for clocking out early",
+            placeholder=(
+                "Scheduled shift end is "
+                f"{clock_out_context['scheduled_clock_out_time']} {clock_out_context['timezone_name']}."
+            ),
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        active_entry = await self.db.get_active_entry(str(interaction.guild_id), str(interaction.user.id))
+        if not active_entry:
+            await interaction.response.send_message(
+                "⚠️ You're not currently clocked in.",
+                ephemeral=True,
+            )
+            return
+
+        reason = self.reason.value.strip()
+        if not reason:
+            await interaction.response.send_message(
+                "⚠️ A reason is required for an early clock-out.",
+                ephemeral=True,
+            )
+            return
+
+        await _perform_clock_out(
+            interaction,
+            self.db,
+            early_clock_out_reason=reason,
+            force_early_clock_out=True,
         )
 
-    return True, None
+
+async def _handle_clock_out_request(interaction: discord.Interaction, db: Database):
+    active_entry = await db.get_active_entry(str(interaction.guild_id), str(interaction.user.id))
+    if not active_entry:
+        await interaction.response.send_message("⚠️ You're not currently clocked in.", ephemeral=True)
+        return
+
+    clock_out_context = await _get_shift_clock_out_context(db, str(interaction.guild_id))
+    if clock_out_context is not None and clock_out_context["is_early"]:
+        await interaction.response.send_modal(EarlyClockOutModal(db, clock_out_context))
+        return
+
+    await _perform_clock_out(interaction, db)
 
 
 class ClockPanel(discord.ui.View):
@@ -219,51 +395,7 @@ class ClockPanel(discord.ui.View):
         if not allowed:
             await interaction.response.send_message(message, ephemeral=True)
             return
-
-        result = await self.db.clock_out(
-            str(interaction.guild_id),
-            str(interaction.user.id)
-        )
-        if not result["success"]:
-            await interaction.response.send_message(
-                "⚠️ You're not currently clocked in.",
-                ephemeral=True
-            )
-            return
-
-        try:
-            if isinstance(interaction.user, discord.Member):
-                await _clear_present_role(interaction.client, interaction.guild, interaction.user)
-                await _clear_on_break_role(interaction.client, interaction.guild, interaction.user)
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
-
-        embed = discord.Embed(
-            title="🔴 Clocked Out",
-            description=f"{interaction.user.mention} has clocked out.",
-            color=0xED4245,
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name="Duration", value=f"**{fmt_duration(result['duration_minutes'])}**", inline=True)
-        embed.add_field(name="Clock In", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`", inline=True)
-        embed.add_field(name="Clock Out", value=f"`{result['clock_out'].replace('T',' ')[:16]} UTC`", inline=True)
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await post_activity_log(
-            interaction.client,
-            str(interaction.guild_id),
-            title="🔴 Clocked Out",
-            color=0xED4245,
-            fields=[
-                ("Employee", interaction.user.mention, True),
-                ("Clock In", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
-                ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
-                ("Duration", f"`{fmt_duration(result['duration_minutes'])}`", True),
-            ],
-            thumbnail_url=interaction.user.display_avatar.url,
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await _handle_clock_out_request(interaction, self.db)
 
     @discord.ui.button(label="☕ Start Break", style=discord.ButtonStyle.primary, custom_id="hr:break_start", row=1)
     async def break_start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -582,59 +714,7 @@ class TimeClock(commands.Cog):
         if not allowed:
             await interaction.response.send_message(message, ephemeral=True)
             return
-
-        result = await self.db.clock_out(
-            str(interaction.guild_id),
-            str(interaction.user.id)
-        )
-        if not result["success"]:
-            await interaction.response.send_message("⚠️ You're not currently clocked in.", ephemeral=True)
-            return
-
-        try:
-            if isinstance(interaction.user, discord.Member):
-                await _clear_present_role(interaction.client, interaction.guild, interaction.user)
-                await _clear_on_break_role(interaction.client, interaction.guild, interaction.user)
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
-        
-        break_minutes = await self.db.get_applied_break_minutes_for_entry(
-            str(interaction.guild_id),
-            result["entry_id"],
-        )
-        config = await self.db.get_overtime_config(str(interaction.guild_id))
-        net_minutes = max(0, result["duration_minutes"] - break_minutes)
-        overtime = 0
-        if (config.get("mode") or "overtime") == "overtime":
-            daily_mins = config["daily_hours"] * 60
-            overtime = max(0, net_minutes - daily_mins)
-        
-        embed = discord.Embed(title="🔴 Clocked Out", color=0xED4245, timestamp=datetime.utcnow())
-        embed.add_field(name="Gross Duration", value=f"`{fmt_duration(result['duration_minutes'])}`", inline=True)
-        embed.add_field(name="Break Time", value=f"`{fmt_duration(break_minutes)}`", inline=True)
-        embed.add_field(name="Net Duration", value=f"**{fmt_duration(net_minutes)}**", inline=True)
-        embed.add_field(name="Clock In", value=f"`{result['clock_in'].replace('T',' ')[:16]} UTC`", inline=True)
-        embed.add_field(name="Clock Out", value=f"`{result['clock_out'].replace('T',' ')[:16]} UTC`", inline=True)
-        if overtime > 0:
-            embed.add_field(name="⚡ Overtime This Session", value=fmt_duration(int(overtime)), inline=True)
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await post_activity_log(
-            interaction.client,
-            str(interaction.guild_id),
-            title="🔴 Clocked Out",
-            color=0xED4245,
-            fields=[
-                ("Employee", interaction.user.mention, True),
-                ("Clock In", f"`{result['clock_in'].replace('T', ' ')[:16]} UTC`", True),
-                ("Clock Out", f"`{result['clock_out'].replace('T', ' ')[:16]} UTC`", True),
-                ("Net Duration", f"`{fmt_duration(net_minutes)}`", True),
-                ("Break Time", f"`{fmt_duration(break_minutes)}`", True),
-            ],
-            thumbnail_url=interaction.user.display_avatar.url,
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await _handle_clock_out_request(interaction, self.db)
 
     @app_commands.command(name="status", description="Check your current clock status and today's hours")
     async def status(self, interaction: discord.Interaction):
@@ -680,7 +760,7 @@ class TimeClock(commands.Cog):
         )
         embed.add_field(
             name="Tip",
-            value="Clocking in can add your Present role. Scheduled and manual breaks can both manage the On Break role, and clock-out clears it.",
+            value="Clocking in can add your Present role. Scheduled breaks start automatically, but break end is manual. Early clock-out asks for a reason before the scheduled shift end.",
             inline=False
         )
         embed.set_footer(text="HR Bot • Time Tracker")

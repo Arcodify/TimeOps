@@ -53,9 +53,20 @@ class CSVExporter:
         self.db = db
         os.makedirs(EXPORT_DIR, exist_ok=True)
 
-    def _write_csv(self, filename: str, rows: List[Dict], fieldnames: List[str]) -> str:
+    def _write_csv(
+        self,
+        filename: str,
+        rows: List[Dict],
+        fieldnames: List[str],
+        note_lines: List[str] | None = None,
+    ) -> str:
         path = os.path.join(EXPORT_DIR, filename)
         with open(path, "w", newline="", encoding="utf-8") as f:
+            raw_writer = csv.writer(f)
+            for note in note_lines or []:
+                raw_writer.writerow([f"NOTE: {note}"])
+            if note_lines:
+                raw_writer.writerow([])
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
@@ -103,15 +114,32 @@ class CSVExporter:
                 "Net Duration": fmt_duration(net_minutes),
                 "Net Minutes": net_minutes if net_minutes is not None else "",
                 "Auto Clock-Out": "Yes" if e["auto_out"] else "No",
+                "Early Clock-Out": "Yes" if e.get("early_clock_out") else "No",
+                "Early Clock-Out Reason": e.get("early_clock_out_reason") or "",
+                "Scheduled Clock-Out Time": e.get("scheduled_clock_out_time") or "",
                 "Note": e["note"] or ""
             })
-        
+
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"timesheet_{_safe_label(period)}_{start.strftime('%Y%m%d')}_{ts}.csv"
         return self._write_csv(filename, rows, [
             "Date", "Employee", "User ID", "Clock In", "Clock Out",
             "Status", "Gross Duration", "Gross Minutes", "Break Minutes",
-            "Net Duration", "Net Minutes", "Auto Clock-Out", "Note"
+            "Net Duration", "Net Minutes", "Auto Clock-Out",
+            "Early Clock-Out", "Early Clock-Out Reason", "Scheduled Clock-Out Time", "Note"
+        ], note_lines=[
+            "Date = UTC calendar date of the clock-in.",
+            "Employee = display name stored at the time of the session.",
+            "User ID = Discord user ID for the employee.",
+            "Clock In / Clock Out = UTC timestamps for the session boundaries.",
+            "Status = completed state of the session, including auto clock-out when applied.",
+            "Gross Duration / Gross Minutes = raw session time before break deductions.",
+            "Break Minutes = applied deducted break minutes for the session.",
+            "Net Duration / Net Minutes = worked time after break deductions.",
+            "Auto Clock-Out = whether the bot ended the session automatically.",
+            "Early Clock-Out / Early Clock-Out Reason = whether the session ended before the final 5-minute shift window and the stored reason.",
+            "Scheduled Clock-Out Time = configured shift end time used for time-shift comparisons.",
+            "Note = optional note entered at clock-in.",
         ])
 
     async def export_summary(self, guild_id: str, period: str,
@@ -171,6 +199,16 @@ class CSVExporter:
             "Break Duration", "Break Minutes", "Total Hours", "Total Minutes",
             "Expected Hours", "Overtime", "Overtime Minutes", "Balance",
             "Balance Minutes", "Sessions"
+        ], note_lines=[
+            "Employee / User ID = the person included in the summary.",
+            "Days Worked = distinct UTC dates with at least one session in the selected range.",
+            "Gross Hours / Gross Minutes = raw time logged before break deductions.",
+            "Break Duration / Break Minutes = total applied break deductions for the range.",
+            "Total Hours / Total Minutes = net worked time after break deductions.",
+            "Expected Hours = baseline hours expected from overtime settings for the days worked.",
+            "Overtime / Overtime Minutes = net time above expected hours when overtime mode is enabled.",
+            "Balance / Balance Minutes = net time minus expected time for the period.",
+            "Sessions = number of sessions included for that employee.",
         ])
 
     async def export_leave(self, guild_id: str, status: str = None) -> str:
@@ -199,6 +237,16 @@ class CSVExporter:
         return self._write_csv(filename, rows, [
             "ID", "Employee", "User ID", "Leave Type", "Start Date", "End Date",
             "Duration Days", "Reason", "Status", "Approver", "Submitted At"
+        ], note_lines=[
+            "ID = internal leave request ID.",
+            "Employee / User ID = employee identity for the leave request.",
+            "Leave Type = category submitted by the employee.",
+            "Start Date / End Date = requested leave range in YYYY-MM-DD.",
+            "Duration Days = inclusive length of the leave request.",
+            "Reason = employee-provided explanation, if any.",
+            "Status = current approval state of the request.",
+            "Approver = manager/admin who approved or denied the request.",
+            "Submitted At = UTC timestamp when the request was created.",
         ])
 
     async def export_work_updates(
@@ -246,6 +294,15 @@ class CSVExporter:
             "Blockers / Notes",
             "Answer",
             "Time Entry ID",
+        ], note_lines=[
+            "Date = UTC calendar date of the prompt.",
+            "Employee / User ID = employee identity for the work update.",
+            "Prompt Slot = sequence key for the prompt within the session.",
+            "Prompted At / Submitted At = UTC timestamps for the prompt and response.",
+            "Instruction = prompt text shown to the employee.",
+            "Current Work / Next Work / Blockers / Notes = parsed sections from the submitted answer.",
+            "Answer = full stored response body.",
+            "Time Entry ID = linked session ID for the update.",
         ])
 
     async def export_daily(self, guild_id: str = None) -> List[str]:

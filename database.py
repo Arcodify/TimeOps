@@ -102,7 +102,10 @@ class Database:
                     clock_out   TEXT,
                     duration_minutes INTEGER,
                     auto_out    INTEGER DEFAULT 0,
-                    note        TEXT
+                    note        TEXT,
+                    early_clock_out INTEGER DEFAULT 0,
+                    early_clock_out_reason TEXT,
+                    scheduled_clock_out_time TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS leave_requests (
@@ -176,7 +179,8 @@ class Database:
                     break_end   TEXT,
                     duration_minutes INTEGER,
                     break_type  TEXT DEFAULT 'break',
-                    reason      TEXT
+                    reason      TEXT,
+                    reminder_sent_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS scheduled_breaks (
@@ -227,7 +231,26 @@ class Database:
                     submitted_at    TEXT NOT NULL,
                     UNIQUE(standup_id, occurrence_key, user_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS reminder_dispatch_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id        TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    reminder_key    TEXT NOT NULL,
+                    sent_at         TEXT NOT NULL,
+                    UNIQUE(guild_id, user_id, reminder_key)
+                );
             """)
+            time_entry_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(time_entries)")).fetchall()
+            }
+            if "early_clock_out" not in time_entry_columns:
+                await db.execute("ALTER TABLE time_entries ADD COLUMN early_clock_out INTEGER DEFAULT 0")
+            if "early_clock_out_reason" not in time_entry_columns:
+                await db.execute("ALTER TABLE time_entries ADD COLUMN early_clock_out_reason TEXT")
+            if "scheduled_clock_out_time" not in time_entry_columns:
+                await db.execute("ALTER TABLE time_entries ADD COLUMN scheduled_clock_out_time TEXT")
             columns = {
                 row[1]
                 for row in await (await db.execute("PRAGMA table_info(guild_config)")).fetchall()
@@ -298,6 +321,8 @@ class Database:
             }
             if "reason" not in break_entries_columns:
                 await db.execute("ALTER TABLE break_entries ADD COLUMN reason TEXT")
+            if "reminder_sent_at" not in break_entries_columns:
+                await db.execute("ALTER TABLE break_entries ADD COLUMN reminder_sent_at TEXT")
             await db.commit()
         log.info("Database initialized")
 
@@ -319,7 +344,15 @@ class Database:
             entry_id = cursor.lastrowid
         return {"success": True, "entry_id": entry_id, "clock_in": now}
 
-    async def clock_out(self, guild_id: str, user_id: str, auto: bool = False) -> Dict:
+    async def clock_out(
+        self,
+        guild_id: str,
+        user_id: str,
+        auto: bool = False,
+        early_clock_out: bool = False,
+        early_clock_out_reason: str = None,
+        scheduled_clock_out_time: str = None,
+    ) -> Dict:
         """Clock a user out. Returns duration."""
         active = await self.get_active_entry(guild_id, user_id)
         if not active:
@@ -331,8 +364,20 @@ class Database:
         
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE time_entries SET clock_out=?, duration_minutes=?, auto_out=? WHERE id=?",
-                (now.isoformat(), duration, 1 if auto else 0, active["id"])
+                """
+                UPDATE time_entries
+                SET clock_out=?, duration_minutes=?, auto_out=?, early_clock_out=?, early_clock_out_reason=?, scheduled_clock_out_time=?
+                WHERE id=?
+                """,
+                (
+                    now.isoformat(),
+                    duration,
+                    1 if auto else 0,
+                    1 if early_clock_out else 0,
+                    early_clock_out_reason,
+                    scheduled_clock_out_time,
+                    active["id"],
+                )
             )
             async with db.execute(
                 "SELECT id, break_start FROM break_entries "
@@ -356,7 +401,10 @@ class Database:
             "duration_minutes": duration,
             "clock_in": active["clock_in"],
             "clock_out": now.isoformat(),
-            "auto": auto
+            "auto": auto,
+            "early_clock_out": early_clock_out,
+            "early_clock_out_reason": early_clock_out_reason,
+            "scheduled_clock_out_time": scheduled_clock_out_time,
         }
 
     async def get_active_entry(self, guild_id: str, user_id: str) -> Optional[Dict]:
@@ -431,7 +479,14 @@ class Database:
             if not should_auto_out:
                 continue
 
-            result = await self.clock_out(row["guild_id"], row["user_id"], auto=True)
+            result = await self.clock_out(
+                row["guild_id"],
+                row["user_id"],
+                auto=True,
+                scheduled_clock_out_time=(
+                    row.get("default_clock_out_time") if mode == "time_shift" and row.get("default_clock_out_time") else None
+                ),
+            )
             log.info("Auto clock-out: %s", row["username"])
             try:
                 user = await bot.fetch_user(int(row["user_id"]))
@@ -769,6 +824,20 @@ class Database:
                 rows = await cur.fetchall()
         return {str(row[0]) for row in rows}
 
+    async def get_known_user_ids_for_guild(self, guild_id: str) -> list[str]:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM time_entries
+                WHERE guild_id=?
+                ORDER BY user_id ASC
+                """,
+                (guild_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [str(row[0]) for row in rows]
+
     async def get_work_rules(self, guild_id: str) -> Dict:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -876,6 +945,7 @@ class Database:
             "work_update_config",
             "work_updates",
             "reminder_config",
+            "reminder_dispatch_log",
             "holidays",
         ]
 
@@ -1059,9 +1129,22 @@ class Database:
                 LIMIT 1
                 """,
                 (guild_id, user_id, time_entry_id)
-            ) as cur:
+                ) as cur:
                 row = await cur.fetchone()
         return dict(row) if row else None
+
+    async def record_reminder_dispatch(self, guild_id: str, user_id: str, reminder_key: str) -> bool:
+        sent_at = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO reminder_dispatch_log (guild_id, user_id, reminder_key, sent_at)
+                VALUES (?,?,?,?)
+                """,
+                (guild_id, user_id, reminder_key, sent_at),
+            )
+            await db.commit()
+        return (cursor.rowcount or 0) > 0
 
     async def submit_standup_submission(
         self,
