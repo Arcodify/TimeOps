@@ -538,13 +538,19 @@ async def recover_logs(args) -> int:
             until = args.until or datetime.now(timezone.utc)
             print(
                 "Scanning history from "
-                f"{since.strftime('%Y-%m-%d %H:%M UTC')} to {until.strftime('%Y-%m-%d %H:%M UTC')}...",
+                f"{(since.strftime('%Y-%m-%d %H:%M UTC') if args.since else 'beginning')} "
+                f"to {until.strftime('%Y-%m-%d %H:%M UTC')}...",
                 flush=True,
             )
 
             scanned = 0
             matched = 0
-            async for message in channel.history(limit=None, oldest_first=True, after=since, before=until):
+            history_kwargs = {"limit": None, "oldest_first": True}
+            if args.since is not None:
+                history_kwargs["after"] = since
+            if args.until is not None:
+                history_kwargs["before"] = until
+            async for message in channel.history(**history_kwargs):
                 scanned += 1
                 if not message.embeds:
                     continue
