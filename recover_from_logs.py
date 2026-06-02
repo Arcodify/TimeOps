@@ -19,6 +19,7 @@ import asyncio
 import csv
 import os
 import re
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -524,14 +525,22 @@ async def recover_logs(args) -> int:
     @client.event
     async def on_ready():
         try:
+            print("Connected to Discord. Resolving guild and channel...", flush=True)
             guild = client.get_guild(int(guild_id)) or await client.fetch_guild(int(guild_id))
+            print(f"Resolved guild: {guild.name} ({guild.id})", flush=True)
             channel = await _resolve_channel(guild, int(channel_id) if channel_id is not None else None, channel_name)
             if channel is None:
                 raise RuntimeError("Could not resolve the activity log channel.")
+            print(f"Resolved channel: {channel.name} ({channel.id})", flush=True)
 
             state = RecoveryState(str(guild.id))
             since = args.since or datetime.min.replace(tzinfo=timezone.utc)
             until = args.until or datetime.now(timezone.utc)
+            print(
+                "Scanning history from "
+                f"{since.strftime('%Y-%m-%d %H:%M UTC')} to {until.strftime('%Y-%m-%d %H:%M UTC')}...",
+                flush=True,
+            )
 
             scanned = 0
             matched = 0
@@ -605,6 +614,8 @@ async def recover_logs(args) -> int:
             print(f"Wrote {len(session_rows)} session rows to: {sessions_path}")
             print(f"Wrote {len(break_rows)} break rows to: {breaks_path}")
             result["ok"] = True
+        except Exception:
+            traceback.print_exc()
         finally:
             ready.set()
             await client.close()
@@ -647,4 +658,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    asyncio.run(recover_logs(_parse_args()))
+    try:
+        raise SystemExit(asyncio.run(recover_logs(_parse_args())))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
