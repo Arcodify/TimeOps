@@ -107,6 +107,34 @@ Post a clock-in panel in your work channel:
 
 ---
 
+## 🛠️ Data Recovery
+
+If the SQLite database is deleted but the activity log channel still exists, you can rebuild attendance CSVs from Discord history:
+
+```bash
+export DISCORD_TOKEN="your-bot-token"
+python recover_from_logs.py --guild-id 123456789012345678 --channel-id 987654321098765432
+```
+
+If your `.env` already has `DISCORD_GUILD_ID` and `DISCORD_ACTIVITY_LOG_CHANNEL_ID`, you can omit the flags:
+
+```bash
+python recover_from_logs.py
+```
+
+If you do not know the channel ID, use `--channel-name` instead:
+
+```bash
+python recover_from_logs.py --guild-id 123456789012345678 --channel-name hr-activity
+```
+
+The script writes recovered CSV files into `exports/`:
+
+- `recovered_timesheet_*.csv`
+- `recovered_breaks_*.csv`
+
+---
+
 ## 📂 File Structure
 
 ```
